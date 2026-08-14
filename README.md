@@ -1,0 +1,167 @@
+# effect-hatchet
+
+Proof of concept: **Hatchet as an execution backend for Effect's `Workflow` API**.
+
+Application code uses Effect's own workflow abstractions (`effect/unstable/workflow`,
+Effect `4.0.0-rc`). Hatchet is an infrastructure detail that only appears in
+bootstrap code.
+
+```
+Business code
+     ↓
+Effect Workflow
+     ↓
+WorkflowEngine          (Effect's service contract)
+     ↓
+HatchetWorkflowEngine   (this PoC)
+     ↓
+Hatchet
+```
+
+## The application's view
+
+A workflow is declared and implemented with Effect only — no Hatchet anywhere:
+
+```ts
+import { Effect, Fiber, Schema } from "effect"
+import { Activity, Workflow } from "effect/unstable/workflow"
+
+export const ProcessInvoice = Workflow.make("ProcessInvoice", {
+  payload: { invoiceId: Schema.Int },
+  success: Invoice,
+  error: InvoiceNotFound,
+  idempotencyKey: ({ invoiceId }) => String(invoiceId)
+})
+
+export const ProcessInvoiceLive = ProcessInvoice.toLayer(
+  Effect.fn(function*(payload) {
+    // Step 1 — activity: load and validate
+    const details = yield* Activity.make({
+      name: "load-invoice",
+      success: InvoiceDetails,
+      error: InvoiceNotFound,
+      execute: Effect.gen(function*() {
+        return yield* (yield* InvoiceService).load(payload.invoiceId)
+      })
+    })
+
+    // Step 2 — durable fan-out: one child workflow per line item
+    const children = yield* Effect.forkChild(
+      Effect.all(
+        details.lineItems.map((item) =>
+          ProcessLineItem.execute({
+            invoiceId: payload.invoiceId,
+            lineItemId: item.id,
+            amountCents: item.amountCents
+          })
+        ),
+        { concurrency: "unbounded" }
+      )
+    )
+
+    // Step 3 — activity: the parent keeps working while children run
+    yield* Activity.make({ name: "notify-processing-started", execute: /* ... */ })
+
+    // Join point — wait for ALL children
+    const postings = yield* Fiber.join(children)
+
+    // Step 4 — activity: finalize with the aggregated total
+    return yield* Activity.make({ name: "finalize", success: Invoice, execute: /* ... */ })
+  })
+)
+```
+
+### Step durability under the Hatchet backend
+
+| Step construct | Maps to | Durability |
+| --- | --- | --- |
+| `Activity.make` | inline step in the parent's Hatchet run | **non-durable**: named + schema'd, but re-runs if the whole workflow re-runs (no replay memoization) |
+| child `Workflow.execute` (`ProcessLineItem`) | its own Hatchet run | **durable**: result persisted server-side; deterministic idempotency key means duplicate dispatches join instead of double-posting |
+
+Fan-out/join is plain Effect: `Effect.forkChild` + `Effect.all` + `Fiber.join`.
+
+and used the same way:
+
+```ts
+const program = Effect.gen(function*() {
+  const invoice = yield* ProcessInvoice.execute({ invoiceId: 123 })
+  yield* Effect.logInfo(`Invoice ${invoice.id} is ${invoice.status}`)
+})
+```
+
+`grep -ri hatchet example/erp/` returns nothing.
+
+## The bootstrap's view
+
+Only infrastructure code selects the backend:
+
+```ts
+// client process
+program.pipe(Effect.provide(HatchetWorkflowEngine.layer()))
+
+// worker process
+const MainLive = HatchetWorker.layer({ name: "erp-worker" }).pipe(
+  Layer.provide(ProcessInvoiceLive),      // registers workflows with the engine
+  Layer.provide(InvoiceService.layer),    // app services reach the handlers here
+  Layer.provideMerge(HatchetWorkflowEngine.layer())
+)
+Effect.runPromise(Layer.launch(MainLive))
+```
+
+Swapping `HatchetWorkflowEngine.layer()` for `WorkflowEngine.layerMemory` (or
+`ClusterWorkflowEngine.layer`) requires no changes to application code.
+
+## Running it
+
+```sh
+pnpm install
+docker compose up -d          # local Hatchet (hatchet-lite) + postgres
+./scripts/hatchet-token.sh    # writes .hatchet-token
+
+export HATCHET_CLIENT_TOKEN=$(cat .hatchet-token) HATCHET_CLIENT_TLS_STRATEGY=none
+pnpm worker                   # terminal 1: worker process
+pnpm main                     # terminal 2: dispatch ProcessInvoice({ invoiceId: 123 })
+```
+
+Dashboard: http://localhost:8888 (admin@example.com / Admin123!!).
+
+## Tests
+
+```sh
+pnpm test        # boundary tests against a mocked Hatchet client
+pnpm test:e2e    # real round trip through dockerized Hatchet (needs token, see above)
+```
+
+The e2e suite proves: real dispatch → Hatchet server → worker → Effect runtime →
+Layer-provided services → typed result/error back to the caller; the parent run
+fans out three real `ProcessLineItem` child runs and joins them; concurrent
+duplicate executions (parents *and* children) join a single run each.
+
+## Layout
+
+```
+src/
+  HatchetWorkflowEngine.ts   # WorkflowEngine implementation (via WorkflowEngine.makeUnsafe)
+  HatchetWorker.ts           # Layer that starts a Hatchet worker for registered workflows
+  internal/
+    serialization.ts         # payload/result codecs reusing the workflow's own schemas
+    errors.ts                # HatchetError (infra failures -> defects)
+example/
+  erp/                       # business code — zero Hatchet imports
+    InvoiceService.ts
+    LedgerService.ts
+    ProcessInvoice.ts        # parent workflow: activities + child fan-out/join
+    ProcessLineItem.ts       # child workflow (durable step)
+  Main.ts                    # client bootstrap
+  Worker.ts                  # worker bootstrap
+test/
+  HatchetWorkflowEngine.test.ts  # mocked-Hatchet boundary tests
+  e2e.test.ts                    # real Hatchet round trip
+```
+
+## Findings
+
+See [FINDINGS.md](./FINDINGS.md) for the verdict on whether Hatchet can
+implement Effect's real `WorkflowEngine` contract (spoiler: mostly — the
+execute/register/poll/interrupt core maps cleanly; durable suspension does
+not).

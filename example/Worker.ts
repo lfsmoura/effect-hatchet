@@ -1,0 +1,28 @@
+/**
+ * Worker bootstrap — the only place (besides Main's engine layer) that knows
+ * Hatchet exists.
+ *
+ * Run with a local Hatchet (see docker-compose.yml):
+ *
+ *     HATCHET_CLIENT_TOKEN=... HATCHET_CLIENT_TLS_STRATEGY=none pnpm worker
+ */
+import { Effect, Layer } from "effect"
+import * as HatchetWorker from "../src/HatchetWorker.ts"
+import * as HatchetWorkflowEngine from "../src/HatchetWorkflowEngine.ts"
+import { InvoiceService } from "./erp/InvoiceService.ts"
+import { LedgerService } from "./erp/LedgerService.ts"
+import { ProcessInvoiceLive } from "./erp/ProcessInvoice.ts"
+import { ProcessLineItemLive } from "./erp/ProcessLineItem.ts"
+
+const MainLive = HatchetWorker.layer({ name: "erp-worker" }).pipe(
+  // Workflow implementations register with the engine before the worker starts
+  Layer.provide(Layer.mergeAll(ProcessInvoiceLive, ProcessLineItemLive)),
+  // Application services reach workflow handlers through this composition
+  Layer.provide(Layer.mergeAll(InvoiceService.layer, LedgerService.layer)),
+  Layer.provideMerge(HatchetWorkflowEngine.layer())
+)
+
+Effect.runPromise(Layer.launch(MainLive)).catch((error) => {
+  console.error(error)
+  process.exit(1)
+})
