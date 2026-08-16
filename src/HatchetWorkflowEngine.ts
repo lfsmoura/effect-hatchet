@@ -1,65 +1,114 @@
 /**
- * `HatchetWorkflowEngine` implements Effect's `WorkflowEngine` service
- * (from `effect/unstable/workflow`) on top of the Hatchet task queue.
+ * Effect WorkflowEngine implementation backed by Hatchet.
  *
- * Workflow executions are dispatched as Hatchet workflow runs; a Hatchet
- * worker re-enters the Effect runtime and executes the workflow handler that
- * was registered via `Workflow.toLayer`, with the Effect context captured at
- * registration time (services such as `InvoiceService` reach the handler this
- * way — see `WorkflowEngine.makeUnsafe`).
- *
- * Modeled after `ClusterWorkflowEngine` (the reference adapter) and the
- * in-memory engine in `WorkflowEngine.layerMemory`.
+ * `layerStrict` rejects workflow capabilities that require durable replay.
+ * `layerRunToCompletion` explicitly opts into inline, at-least-once activities.
  */
-import type { HatchetClient as HatchetClientType, TaskWorkflowDeclaration } from "@hatchet-dev/typescript-sdk/v1"
+import type {
+  HatchetClient as HatchetClientType,
+  JsonObject,
+  RunDetail
+} from "@hatchet-dev/typescript-sdk/v1"
 import { HatchetClient, IdempotencyCollisionError } from "@hatchet-dev/typescript-sdk/v1"
-import { Cause, Context, Effect, Exit, Layer, Option, Schedule } from "effect"
+import { Cause, Config, Duration, Effect, Exit, Layer, Option, Redacted, Schedule } from "effect"
 import { Workflow, WorkflowEngine } from "effect/unstable/workflow"
-import { HatchetError, toHatchetError } from "./internal/errors.ts"
+import {
+  HatchetError,
+  makeUnsupportedWorkflowCapability,
+  toHatchetError,
+  UnsupportedWorkflowCapability
+} from "./internal/errors.ts"
+import { type ActivityMode, HatchetRuntime } from "./internal/HatchetRuntime.ts"
 import type { RunInput } from "./internal/serialization.ts"
 import { codecFor, unwrapTaskOutput } from "./internal/serialization.ts"
 
-/**
- * Internal engine state shared between the engine layer and
- * `HatchetWorker.layer`: the Hatchet client plus the task declarations
- * produced by `register`.
- */
-export class HatchetEngine extends Context.Service<HatchetEngine, {
-  readonly client: HatchetClientType
-  readonly config: HatchetConfig
-  /** Hatchet task declarations, keyed by workflow tag. Populated by `register`. */
-  readonly tasks: Map<string, TaskWorkflowDeclaration<any, any>>
-  /** executionId -> Hatchet workflow run id, for poll/interrupt. */
-  readonly runIds: Map<string, string>
-}>()("effect-hatchet/HatchetWorkflowEngine/HatchetEngine") {}
-
 export interface HatchetConfig {
-  readonly token?: string
+  /** Inject an existing client, primarily for tests and custom transports. */
+  readonly client?: HatchetClientType
+  readonly token?: Redacted.Redacted<string>
   readonly hostPort?: string
   readonly tlsStrategy?: "tls" | "mtls" | "none"
-  /** How long an execution's idempotency key may outlive a non-terminal run. */
-  readonly idempotencyFallbackTtlMs?: number
+  /** How long an execution idempotency key may outlive a non-terminal run. */
+  readonly idempotencyFallbackTtl?: Duration.Input
   /** Interval for polling run results. Defaults to 300 millis. */
-  readonly resultPollInterval?: number
+  readonly resultPollInterval?: Duration.Input
 }
+
+const EnvironmentConfig = Config.all({
+  token: Config.redacted("HATCHET_CLIENT_TOKEN"),
+  hostPort: Config.option(Config.string("HATCHET_CLIENT_HOST_PORT")),
+  tlsStrategy: Config.option(
+    Config.literals(["tls", "mtls", "none"], "HATCHET_CLIENT_TLS_STRATEGY")
+  ),
+  idempotencyFallbackTtl: Config.duration("HATCHET_IDEMPOTENCY_FALLBACK_TTL").pipe(
+    Config.withDefault(Duration.hours(24))
+  ),
+  resultPollInterval: Config.duration("HATCHET_RESULT_POLL_INTERVAL").pipe(
+    Config.withDefault(Duration.millis(300))
+  )
+})
+
+/** Effect-native Hatchet configuration loaded from the current ConfigProvider. */
+export const configFromEnv: Effect.Effect<HatchetConfig, Config.ConfigError> =
+  EnvironmentConfig.pipe(
+    Effect.map((config) => ({
+      token: config.token,
+      ...(Option.isSome(config.hostPort) ? { hostPort: config.hostPort.value } : {}),
+      ...(Option.isSome(config.tlsStrategy) ? { tlsStrategy: config.tlsStrategy.value } : {}),
+      idempotencyFallbackTtl: config.idempotencyFallbackTtl,
+      resultPollInterval: config.resultPollInterval
+    }))
+  )
 
 const infraRetry = { times: 3, schedule: Schedule.exponential(250) }
 
-/**
- * Creates a `WorkflowEngine` implementation backed by Hatchet.
- */
-export const make: Effect.Effect<WorkflowEngine.WorkflowEngine["Service"], never, HatchetEngine> = Effect.gen(
-  function*() {
-    const state = yield* HatchetEngine
+const runtimeLayer = (
+  activityMode: ActivityMode,
+  config: HatchetConfig
+): Layer.Layer<HatchetRuntime, HatchetError> =>
+  Layer.effect(
+    HatchetRuntime,
+    Effect.try({
+      try: () => {
+        const client = config.client ?? HatchetClient.init({
+          ...(config.token !== undefined ? { token: Redacted.value(config.token) } : {}),
+          ...(config.hostPort !== undefined ? { host_port: config.hostPort } : {}),
+          ...(config.tlsStrategy !== undefined
+            ? { tls_config: { tls_strategy: config.tlsStrategy } }
+            : {})
+        })
+        return HatchetRuntime.of({
+          client,
+          config: {
+            activityMode,
+            idempotencyFallbackTtlMs: Duration.toMillis(
+              config.idempotencyFallbackTtl ?? "24 hours"
+            ),
+            resultPollIntervalMs: Duration.toMillis(
+              config.resultPollInterval ?? "300 millis"
+            )
+          },
+          tasks: new Map(),
+          runIds: new Map()
+        })
+      },
+      catch: toHatchetError("Client")
+    })
+  )
+
+const unsupported = (capability: UnsupportedWorkflowCapability["capability"]) =>
+  Effect.die(makeUnsupportedWorkflowCapability({ capability }))
+
+const make: Effect.Effect<WorkflowEngine.WorkflowEngine["Service"], never, HatchetRuntime> =
+  Effect.gen(function*() {
+    const state = yield* HatchetRuntime
     const { client, config } = state
-    const pollInterval = config.resultPollInterval ?? 300
     const deferredState = WorkflowEngine.makeDeferredState()
 
     const runIdFor = (workflow: Workflow.Any, executionId: string) =>
       Effect.gen(function*() {
         const cached = state.runIds.get(executionId)
         if (cached !== undefined) return Option.some(cached)
-        // Cross-process lookup: runs are tagged with the executionId.
         const runs = yield* Effect.tryPromise({
           try: () =>
             client.runs.list({
@@ -69,18 +118,17 @@ export const make: Effect.Effect<WorkflowEngine.WorkflowEngine["Service"], never
             }),
           catch: toHatchetError("Poll")
         })
-        const row = (runs as any)?.rows?.[0]
+        const row = runs.rows[0]
         if (row === undefined) return Option.none<string>()
-        const runId: string = row.metadata?.id ?? row.externalId
+        const runId = row.metadata.id
         state.runIds.set(executionId, runId)
         return Option.some(runId)
       })
 
-    const resultFromDetails = (workflow: Workflow.Any, details: {
-      status: string
-      done: boolean
-      taskRuns: Record<string, { output: unknown; error?: string | undefined }>
-    }): Effect.Effect<Option.Option<Workflow.Result<unknown, unknown>>> =>
+    const resultFromDetails = (
+      workflow: Workflow.Any,
+      details: RunDetail
+    ): Effect.Effect<Option.Option<Workflow.Result<unknown, unknown>>> =>
       Effect.gen(function*() {
         if (!details.done) return Option.none<Workflow.Result<unknown, unknown>>()
         const taskRun = Object.values(details.taskRuns)[0]
@@ -91,14 +139,8 @@ export const make: Effect.Effect<WorkflowEngine.WorkflowEngine["Service"], never
             return Option.some(yield* Effect.orDie(codec.decodeResult(output)))
           }
           case "CANCELLED":
-            return Option.some(
-              new Workflow.Complete({ exit: Exit.failCause(Cause.interrupt()) })
-            )
+            return Option.some(new Workflow.Complete({ exit: Exit.failCause(Cause.interrupt()) }))
           case "FAILED":
-            // The run failed outside the workflow's typed error channel
-            // (worker crash, timeout, uncaught defect with CaptureDefects
-            // disabled) — surface as a defect, like ClusterWorkflowEngine's
-            // `Effect.orDie` boundary.
             return Option.some(
               new Workflow.Complete({
                 exit: Exit.die(
@@ -123,7 +165,7 @@ export const make: Effect.Effect<WorkflowEngine.WorkflowEngine["Service"], never
           }).pipe(Effect.retry(infraRetry), Effect.orDie)
           const result = yield* resultFromDetails(workflow, details)
           if (Option.isSome(result)) return result.value
-          yield* Effect.sleep(pollInterval)
+          yield* Effect.sleep(config.resultPollIntervalMs)
         }
       })
 
@@ -134,11 +176,9 @@ export const make: Effect.Effect<WorkflowEngine.WorkflowEngine["Service"], never
             const declaration = state.tasks.get(workflow._tag)
             const ref = declaration !== undefined
               ? await declaration.runNoWait(input, { additionalMetadata: { executionId } })
-              : await client.runNoWait(workflow._tag, input as any, { additionalMetadata: { executionId } })
+              : await client.runNoWait(workflow._tag, input, { additionalMetadata: { executionId } })
             return await ref.runId
           } catch (error) {
-            // Deterministic execution ids: a second `execute` with the same
-            // payload joins the run that already owns the idempotency key.
             if (error instanceof IdempotencyCollisionError) {
               return error.existingRunExternalId
             }
@@ -162,33 +202,42 @@ export const make: Effect.Effect<WorkflowEngine.WorkflowEngine["Service"], never
         })
       }).pipe(Effect.retry(infraRetry), Effect.orDie, Effect.asVoid)
 
-    const unsupported = (feature: string) =>
-      Effect.die(
-        new HatchetError({
-          reason: "Worker",
-          message: `${feature} is not supported by HatchetWorkflowEngine: it requires ` +
-            `durable suspension/replay, which Hatchet does not expose for externally-defined workflow state`
-        })
-      )
+    const executeWorkflow: WorkflowEngine.Encoded["execute"] = <const Discard extends boolean>(
+      workflow: Workflow.Any,
+      { discard, executionId, payload }: {
+        readonly executionId: string
+        readonly payload: object
+        readonly discard: Discard
+      }
+    ) => {
+      const execution = Effect.gen(function*() {
+        const codec = codecFor(workflow)
+        const encoded = yield* Effect.orDie(codec.encodePayload(payload))
+        const runId = yield* dispatch(workflow, executionId, { executionId, payload: encoded })
+        if (discard) return
+        return yield* awaitResult(workflow, runId)
+      })
+      // TypeScript cannot narrow a generic boolean inside Effect.gen; the two
+      // branches exactly implement WorkflowEngine.Encoded's conditional result.
+      return execution as unknown as Effect.Effect<
+        Discard extends true ? void : Workflow.Result<unknown, unknown>
+      >
+    }
 
     const engine = WorkflowEngine.makeUnsafe({
       register: (workflow, execute) =>
         Effect.gen(function*() {
           if (state.tasks.has(workflow._tag)) {
-            return yield* Effect.die(`Workflow ${workflow._tag} already registered`)
+            return yield* Effect.die(new Error(`Workflow ${workflow._tag} already registered`))
           }
           const codec = codecFor(workflow)
-          const task = state.client.task<Record<string, any>, any>({
+          const task = state.client.task<RunInput, JsonObject>({
             name: workflow._tag,
-            // Retries/durability belong to the Effect side of the boundary:
-            // the workflow's own logic (Activity.retry etc.) decides retry
-            // semantics. A Hatchet-level retry would re-run the whole
-            // workflow without replay, so keep it at 0.
             retries: 0,
             idempotency: {
               expression: "input.executionId",
               strategy: "status",
-              fallbackTtlMs: config.idempotencyFallbackTtlMs ?? 24 * 60 * 60 * 1000
+              fallbackTtlMs: config.idempotencyFallbackTtlMs
             },
             fn: (input, ctx) => {
               const instance = WorkflowEngine.WorkflowInstance.initial(workflow, input.executionId)
@@ -200,23 +249,12 @@ export const make: Effect.Effect<WorkflowEngine.WorkflowEngine["Service"], never
                 Effect.flatMap((result) => Effect.orDie(codec.encodeResult(result))),
                 Effect.provideService(WorkflowEngine.WorkflowEngine, engine)
               )
-              // Hatchet cancellation -> Effect interruption. The registration
-              // context captured by `WorkflowEngine.makeUnsafe` is already
-              // baked into `execute`, so the app's services (Layers) are
-              // available without rebuilding anything per run.
-              return Effect.runPromise(effect, { signal: ctx.abortController.signal }) as Promise<any>
+              return Effect.runPromise(effect, { signal: ctx.abortController.signal })
             }
           })
           state.tasks.set(workflow._tag, task)
         }),
-      execute: (workflow, { discard, executionId, payload }) =>
-        Effect.gen(function*() {
-          const codec = codecFor(workflow)
-          const encoded = yield* Effect.orDie(codec.encodePayload(payload))
-          const runId = yield* dispatch(workflow, executionId, { executionId, payload: encoded })
-          if (discard) return undefined as any
-          return yield* awaitResult(workflow, runId)
-        }),
+      execute: executeWorkflow,
       poll: (workflow, executionId) =>
         Effect.gen(function*() {
           const runId = yield* runIdFor(workflow, executionId)
@@ -229,13 +267,19 @@ export const make: Effect.Effect<WorkflowEngine.WorkflowEngine["Service"], never
         }).pipe(Effect.retry(infraRetry), Effect.orDie),
       interrupt: cancel,
       interruptUnsafe: cancel,
-      resume: () => unsupported("Workflow.resume"),
+      resume: () => unsupported("Resume"),
       activityExecute: Effect.fnUntraced(function*(activity, _attempt) {
-        // Activities execute inline in the workflow run, exactly like the
-        // in-memory engine. Their results are NOT persisted: Hatchet offers
-        // no per-key storage for externally-executed steps, and without
-        // suspension there is no replay that would read them back.
         const instance = yield* WorkflowEngine.WorkflowInstance
+        if (config.activityMode === "strict") {
+          return yield* Effect.die(
+            makeUnsupportedWorkflowCapability({
+              capability: "Activity",
+              workflow: instance.workflow._tag,
+              executionId: instance.executionId,
+              activity: activity.name
+            })
+          )
+        }
         const activityInstance = WorkflowEngine.WorkflowInstance.initial(
           instance.workflow,
           instance.executionId
@@ -252,39 +296,45 @@ export const make: Effect.Effect<WorkflowEngine.WorkflowEngine["Service"], never
     })
 
     return engine
-  }
-)
+  })
 
-const layerEngineState = (config: HatchetConfig = {}): Layer.Layer<HatchetEngine> =>
-  Layer.sync(HatchetEngine)(() =>
-    HatchetEngine.of({
-      client: HatchetClient.init({
-        ...(config.token !== undefined ? { token: config.token } : {}),
-        ...(config.hostPort !== undefined ? { host_port: config.hostPort } : {}),
-        ...(config.tlsStrategy !== undefined
-          ? { tls_config: { tls_strategy: config.tlsStrategy } as any }
-          : {})
-      }),
-      config,
-      tasks: new Map(),
-      runIds: new Map()
-    })
+/** @internal Shared engine/runtime layer used by HatchetWorker. */
+export const layerInternal = (
+  activityMode: ActivityMode,
+  config: HatchetConfig = {}
+): Layer.Layer<WorkflowEngine.WorkflowEngine | HatchetRuntime, HatchetError> =>
+  Layer.effect(WorkflowEngine.WorkflowEngine)(make).pipe(
+    Layer.provideMerge(runtimeLayer(activityMode, config))
   )
+
+const publicLayer = (
+  activityMode: ActivityMode,
+  config: HatchetConfig
+): Layer.Layer<WorkflowEngine.WorkflowEngine, HatchetError> =>
+  Layer.effect(WorkflowEngine.WorkflowEngine)(make).pipe(
+    Layer.provide(runtimeLayer(activityMode, config))
+  )
+
+/** Strict engine: durable activities and suspension capabilities fail explicitly. */
+export const layerStrict = (
+  config: HatchetConfig = {}
+): Layer.Layer<WorkflowEngine.WorkflowEngine, HatchetError> => publicLayer("strict", config)
 
 /**
- * Layer providing `WorkflowEngine` backed by Hatchet.
- *
- * On its own this is enough for *client* processes (dispatching, polling and
- * interrupting executions). Processes that should *execute* workflows
- * additionally compose `HatchetWorker.layer`, which starts a Hatchet worker
- * for every workflow registered through `Workflow.toLayer`.
- *
- * Configuration falls back to the standard Hatchet environment variables
- * (`HATCHET_CLIENT_TOKEN`, ...) when not provided.
+ * Run-to-completion engine. Activities execute inline with at-least-once
+ * semantics and may repeat if Hatchet re-runs the parent workflow.
  */
-export const layer = (
-  config?: HatchetConfig
-): Layer.Layer<WorkflowEngine.WorkflowEngine | HatchetEngine> =>
-  Layer.effect(WorkflowEngine.WorkflowEngine)(make).pipe(
-    Layer.provideMerge(layerEngineState(config))
-  )
+export const layerRunToCompletion = (
+  config: HatchetConfig = {}
+): Layer.Layer<WorkflowEngine.WorkflowEngine, HatchetError> =>
+  publicLayer("inline-at-least-once", config)
+
+export const layerStrictFromConfig: Layer.Layer<
+  WorkflowEngine.WorkflowEngine,
+  HatchetError | Config.ConfigError
+> = Layer.unwrap(configFromEnv.pipe(Effect.map(layerStrict)))
+
+export const layerRunToCompletionFromConfig: Layer.Layer<
+  WorkflowEngine.WorkflowEngine,
+  HatchetError | Config.ConfigError
+> = Layer.unwrap(configFromEnv.pipe(Effect.map(layerRunToCompletion)))

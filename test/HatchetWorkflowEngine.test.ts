@@ -7,7 +7,7 @@
  *   dispatch → task handler → Effect runtime → workflow implementation →
  *   Layer-provided InvoiceService → encoded result → decoded typed result.
  */
-import { Cause, Effect, Exit, Layer, Result } from "effect"
+import { Cause, ConfigProvider, Duration, Effect, Exit, Layer, Redacted, Result } from "effect"
 
 const firstError = (cause: Cause.Cause<unknown>): unknown => {
   const found = Cause.findError(cause)
@@ -19,7 +19,9 @@ import { InvoiceNotFound, InvoiceService } from "../example/erp/InvoiceService.t
 import { LedgerService } from "../example/erp/LedgerService.ts"
 import { ProcessInvoice, ProcessInvoiceLive } from "../example/erp/ProcessInvoice.ts"
 import { ProcessLineItemLive } from "../example/erp/ProcessLineItem.ts"
-import { HatchetEngine, make } from "../src/HatchetWorkflowEngine.ts"
+import * as HatchetWorkflowEngine from "../src/HatchetWorkflowEngine.ts"
+import * as HatchetWorker from "../src/HatchetWorker.ts"
+import { HatchetError, UnsupportedWorkflowCapability } from "../src/internal/errors.ts"
 
 interface FakeRun {
   status: "RUNNING" | "COMPLETED" | "FAILED" | "CANCELLED"
@@ -28,11 +30,12 @@ interface FakeRun {
 }
 
 /** Minimal in-memory stand-in for the Hatchet server + SDK. */
-const makeFakeHatchet = () => {
+const makeFakeHatchet = (workerFailure?: Error) => {
   const fns = new Map<string, (input: any, ctx: any) => Promise<any>>()
   const runs = new Map<string, FakeRun>()
   const byIdempotencyKey = new Map<string, string>()
   let counter = 0
+  const workerState = { starts: 0, stops: 0 }
 
   const start = (name: string, input: any): string => {
     // Simulates Hatchet's status-based idempotency on `input.executionId`:
@@ -62,6 +65,19 @@ const makeFakeHatchet = () => {
       }
     },
     runNoWait: async (name: string, input: any) => ({ runId: Promise.resolve(start(name, input)) }),
+    worker: async () => {
+      if (workerFailure !== undefined) throw workerFailure
+      return {
+        start: () => {
+          workerState.starts++
+          return new Promise<void>(() => {})
+        },
+        waitUntilReady: async () => {},
+        stop: async () => {
+          workerState.stops++
+        }
+      }
+    },
     runs: {
       getDetails: async (runId: string) => {
         const run = runs.get(runId)
@@ -86,23 +102,15 @@ const makeFakeHatchet = () => {
       list: async () => ({ rows: [] })
     }
   }
-  return { client: client as any, runs }
+  return { client: client as any, runs, workerState }
 }
 
 const makeTestLayer = () => {
   const fake = makeFakeHatchet()
-  const engineLayer = Layer.effect(WorkflowEngine.WorkflowEngine)(make).pipe(
-    Layer.provideMerge(
-      Layer.sync(HatchetEngine)(() =>
-        HatchetEngine.of({
-          client: fake.client,
-          config: { resultPollInterval: 10 },
-          tasks: new Map(),
-          runIds: new Map()
-        })
-      )
-    )
-  )
+  const engineLayer = HatchetWorkflowEngine.layerRunToCompletion({
+    client: fake.client,
+    resultPollInterval: "10 millis"
+  })
   const layer = Layer.mergeAll(ProcessInvoiceLive, ProcessLineItemLive).pipe(
     Layer.provide(Layer.mergeAll(InvoiceService.layer, LedgerService.layer)),
     Layer.provideMerge(engineLayer)
@@ -165,18 +173,10 @@ describe("HatchetWorkflowEngine", () => {
     const fake = makeFakeHatchet()
     // Engine without any registered worker: dispatch reaches Hatchet but the
     // run fails at the infrastructure level.
-    const engineLayer = Layer.effect(WorkflowEngine.WorkflowEngine)(make).pipe(
-      Layer.provideMerge(
-        Layer.sync(HatchetEngine)(() =>
-          HatchetEngine.of({
-            client: fake.client,
-            config: { resultPollInterval: 10 },
-            tasks: new Map(),
-            runIds: new Map()
-          })
-        )
-      )
-    )
+    const engineLayer = HatchetWorkflowEngine.layerRunToCompletion({
+      client: fake.client,
+      resultPollInterval: "10 millis"
+    })
     const exit = await Effect.runPromiseExit(
       ProcessInvoice.execute({ invoiceId: 1 }).pipe(Effect.provide(engineLayer))
     )
@@ -186,5 +186,90 @@ describe("HatchetWorkflowEngine", () => {
     // No typed InvoiceNotFound here — infra problems never masquerade as
     // application errors.
     expect(cause !== undefined ? firstError(cause) : undefined).not.toBeInstanceOf(InvoiceNotFound)
+  })
+
+  it("rejects Activity.make by default with a structured defect", async () => {
+    const fake = makeFakeHatchet()
+    const engineLayer = HatchetWorkflowEngine.layerStrict({
+      client: fake.client,
+      resultPollInterval: "10 millis"
+    })
+    const layer = Layer.mergeAll(ProcessInvoiceLive, ProcessLineItemLive).pipe(
+      Layer.provide(Layer.mergeAll(InvoiceService.layer, LedgerService.layer)),
+      Layer.provideMerge(engineLayer)
+    )
+
+    const exit = await Effect.runPromiseExit(
+      ProcessInvoice.execute({ invoiceId: 123 }).pipe(Effect.provide(layer))
+    )
+    const defectResult = Exit.isFailure(exit) ? Cause.findDefect(exit.cause) : undefined
+    const defect = defectResult !== undefined && Result.isSuccess(defectResult)
+      ? defectResult.success
+      : undefined
+
+    expect(defect).toBeInstanceOf(Error)
+    if (!(defect instanceof Error)) throw new Error("missing capability defect")
+    expect(defect.cause).toMatchObject({
+      _tag: "UnsupportedWorkflowCapability",
+      capability: "Activity",
+      activity: "load-invoice"
+    })
+  })
+
+  it("keeps worker startup failures in the typed error channel", async () => {
+    const fake = makeFakeHatchet(new Error("worker unavailable"))
+    const workerLayer = HatchetWorker.layerStrict({
+      name: "test-worker",
+      workflows: ProcessLineItemLive,
+      readyTimeout: "1 second"
+    }, { client: fake.client }).pipe(
+      Layer.provide(LedgerService.layer)
+    )
+
+    const exit = await Effect.runPromiseExit(Layer.build(workerLayer).pipe(Effect.scoped))
+    const error = Exit.isFailure(exit) ? firstError(exit.cause) : undefined
+
+    expect(error).toBeInstanceOf(HatchetError)
+    if (!(error instanceof HatchetError)) throw new Error("missing worker error")
+    expect(error.reason).toBe("Worker")
+  })
+
+  it("starts and stops the worker within the layer scope", async () => {
+    const fake = makeFakeHatchet()
+    const workerLayer = HatchetWorker.layerStrict({
+      name: "test-worker",
+      workflows: ProcessLineItemLive,
+      readyTimeout: "1 second"
+    }, { client: fake.client }).pipe(
+      Layer.provide(LedgerService.layer)
+    )
+
+    await Effect.runPromise(Layer.build(workerLayer).pipe(Effect.scoped))
+
+    expect(fake.workerState.starts).toBe(1)
+    expect(fake.workerState.stops).toBe(1)
+  })
+
+  it("loads redacted secrets and duration settings through Effect Config", async () => {
+    const provider = ConfigProvider.fromUnknown({
+      HATCHET_CLIENT_TOKEN: "secret-token",
+      HATCHET_CLIENT_TLS_STRATEGY: "none",
+      HATCHET_IDEMPOTENCY_FALLBACK_TTL: "1 hour",
+      HATCHET_RESULT_POLL_INTERVAL: "2 seconds"
+    })
+
+    const config = await Effect.runPromise(
+      HatchetWorkflowEngine.configFromEnv.pipe(
+        Effect.provideService(ConfigProvider.ConfigProvider, provider)
+      )
+    )
+
+    if (config.token === undefined) throw new Error("missing token")
+    if (config.idempotencyFallbackTtl === undefined) throw new Error("missing idempotency TTL")
+    if (config.resultPollInterval === undefined) throw new Error("missing poll interval")
+    expect(Redacted.value(config.token)).toBe("secret-token")
+    expect(config.tlsStrategy).toBe("none")
+    expect(Duration.toMillis(config.idempotencyFallbackTtl)).toBe(3_600_000)
+    expect(Duration.toMillis(config.resultPollInterval)).toBe(2_000)
   })
 })

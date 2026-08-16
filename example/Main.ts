@@ -17,7 +17,7 @@ const program = Effect.gen(function*() {
 
 // Infrastructure boundary: only here does Hatchet appear.
 program.pipe(
-  Effect.provide(HatchetWorkflowEngine.layer()),
+  Effect.provide(HatchetWorkflowEngine.layerRunToCompletionFromConfig),
   Effect.runPromise
 ).catch((error) => {
   console.error(error)

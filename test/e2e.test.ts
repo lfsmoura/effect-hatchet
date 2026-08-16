@@ -13,7 +13,7 @@
  * Skipped when no token is available (env HATCHET_CLIENT_TOKEN or
  * .hatchet-token file).
  */
-import { Cause, Effect, Exit, Layer, Result } from "effect"
+import { Cause, Effect, Exit, Layer, Redacted, Result } from "effect"
 import { existsSync, readFileSync } from "node:fs"
 import { describe, expect, it } from "vitest"
 import * as HatchetWorker from "../src/HatchetWorker.ts"
@@ -30,22 +30,24 @@ const token = process.env.HATCHET_CLIENT_TOKEN ??
 const describeE2e = token === undefined ? describe.skip : describe
 
 const config: HatchetWorkflowEngine.HatchetConfig = {
-  ...(token !== undefined ? { token } : {}),
+  ...(token !== undefined ? { token: Redacted.make(token) } : {}),
   tlsStrategy: "none",
-  resultPollInterval: 250
+  resultPollInterval: "250 millis"
 }
 
 // Worker side: engine + registered workflow implementation + started worker.
-const WorkerLive = HatchetWorker.layer({ name: "e2e-worker", slots: 10 }).pipe(
-  Layer.provide(Layer.mergeAll(ProcessInvoiceLive, ProcessLineItemLive)),
-  Layer.provide(Layer.mergeAll(InvoiceService.layer, LedgerService.layer)),
-  Layer.provideMerge(HatchetWorkflowEngine.layer(config))
+const WorkerLive = HatchetWorker.layerRunToCompletion({
+  name: "e2e-worker",
+  slots: 10,
+  workflows: Layer.mergeAll(ProcessInvoiceLive, ProcessLineItemLive)
+}, config).pipe(
+  Layer.provide(Layer.mergeAll(InvoiceService.layer, LedgerService.layer))
 )
 
 // Client side: a *separate* engine instance that never registered anything —
 // it can only reach the workflow through the Hatchet server, like a second
 // process would.
-const ClientLive = HatchetWorkflowEngine.layer(config)
+const ClientLive = HatchetWorkflowEngine.layerRunToCompletion(config)
 
 describeE2e("HatchetWorkflowEngine e2e", () => {
   it("dispatches through Hatchet to a worker that re-enters the Effect runtime", async () => {

@@ -1,63 +1,99 @@
-/**
- * Starts a Hatchet worker that executes every workflow registered with the
- * `HatchetWorkflowEngine` (i.e. every `Workflow.toLayer` layer in the
- * application).
- *
- * Compose it so the workflow implementation layers are dependencies — that
- * guarantees all registrations have happened before the worker starts:
- *
- * ```ts
- * const WorkerLive = HatchetWorker.layer({ name: "erp-worker" }).pipe(
- *   Layer.provide(ProcessInvoiceLive),                 // registers workflows
- *   Layer.provideMerge(HatchetWorkflowEngine.layer())  // the engine itself
- * )
- * ```
- *
- * The worker's lifetime is tied to the layer scope: closing the scope stops
- * the worker (the closest analogue of the cluster runner's resource
- * lifecycle).
- */
-import { Effect, Layer } from "effect"
-import { HatchetEngine } from "./HatchetWorkflowEngine.ts"
-import { toHatchetError } from "./internal/errors.ts"
+/** Starts a scoped Hatchet worker after registering its workflow layers. */
+import type * as Config from "effect/Config"
+import { Duration, Effect, Layer } from "effect"
+import { WorkflowEngine } from "effect/unstable/workflow"
+import type { HatchetConfig } from "./HatchetWorkflowEngine.ts"
+import { configFromEnv, layerInternal } from "./HatchetWorkflowEngine.ts"
+import { HatchetError, toHatchetError } from "./internal/errors.ts"
+import type { ActivityMode } from "./internal/HatchetRuntime.ts"
+import { HatchetRuntime } from "./internal/HatchetRuntime.ts"
 
-export interface HatchetWorkerOptions {
+export interface HatchetWorkerOptions<E = never, R = never> {
   readonly name: string
+  /** Workflow implementation layers to register before the worker starts. */
+  readonly workflows: Layer.Layer<never, E, R>
   /** Maximum concurrent workflow runs. Defaults to 100. */
   readonly slots?: number
-  /** How long to wait for the worker to connect and register. Defaults to 30s. */
-  readonly readyTimeoutMs?: number
+  /** How long to wait for the worker to connect and register. Defaults to 30 seconds. */
+  readonly readyTimeout?: Duration.Input
 }
 
-export const layer = (options: HatchetWorkerOptions): Layer.Layer<never, never, HatchetEngine> =>
+const workerLayer = (
+  options: Omit<HatchetWorkerOptions<unknown, unknown>, "workflows">
+): Layer.Layer<never, HatchetError, HatchetRuntime> =>
   Layer.effectDiscard(
     Effect.gen(function*() {
-      const state = yield* HatchetEngine
+      const state = yield* HatchetRuntime
       if (state.tasks.size === 0) {
         return yield* Effect.die(
-          "HatchetWorker.layer built with no registered workflows — provide the " +
-            "Workflow.toLayer layers as dependencies of the worker layer"
+          new Error(
+            "HatchetWorker built with no registered workflows; pass Workflow.toLayer layers in the workflows option"
+          )
         )
       }
-      yield* Effect.acquireRelease(
+
+      const worker = yield* Effect.acquireRelease(
         Effect.tryPromise({
-          try: async () => {
-            const worker = await state.client.worker(options.name, {
+          try: () =>
+            state.client.worker(options.name, {
               workflows: [...state.tasks.values()],
               slots: options.slots ?? 100
-            })
-            // `start` resolves only when the worker shuts down; run it in the
-            // background and wait for registration instead.
-            void worker.start()
-            await worker.waitUntilReady(options.readyTimeoutMs ?? 30_000)
-            return worker
-          },
+            }),
           catch: toHatchetError("Worker")
-        }).pipe(Effect.orDie),
+        }),
         (worker) => Effect.promise(() => worker.stop()).pipe(Effect.ignore)
       )
+
+      yield* Effect.tryPromise({
+        try: () => worker.start(),
+        catch: toHatchetError("Worker")
+      }).pipe(
+        Effect.tapError((error) => Effect.logError("Hatchet worker stopped unexpectedly", error)),
+        Effect.forkScoped
+      )
+      yield* Effect.yieldNow
+
+      yield* Effect.tryPromise({
+        try: () => worker.waitUntilReady(Duration.toMillis(options.readyTimeout ?? "30 seconds")),
+        catch: toHatchetError("Worker")
+      })
+
       yield* Effect.logInfo(`HatchetWorker "${options.name}" started`).pipe(
         Effect.annotateLogs({ workflows: [...state.tasks.keys()].join(", ") })
       )
     })
   )
+
+const layerWithMode = <E, R>(
+  activityMode: ActivityMode,
+  options: HatchetWorkerOptions<E, R>,
+  config: HatchetConfig
+): Layer.Layer<never, E | HatchetError, Exclude<R, WorkflowEngine.WorkflowEngine | HatchetRuntime>> =>
+  workerLayer(options).pipe(
+    Layer.provide(options.workflows),
+    Layer.provide(layerInternal(activityMode, config))
+  )
+
+/** Strict worker: durable activities and suspension capabilities fail explicitly. */
+export const layerStrict = <E, R>(
+  options: HatchetWorkerOptions<E, R>,
+  config: HatchetConfig = {}
+): Layer.Layer<never, E | HatchetError, Exclude<R, WorkflowEngine.WorkflowEngine | HatchetRuntime>> =>
+  layerWithMode("strict", options, config)
+
+/** Worker for run-to-completion workflows with inline, at-least-once activities. */
+export const layerRunToCompletion = <E, R>(
+  options: HatchetWorkerOptions<E, R>,
+  config: HatchetConfig = {}
+): Layer.Layer<never, E | HatchetError, Exclude<R, WorkflowEngine.WorkflowEngine | HatchetRuntime>> =>
+  layerWithMode("inline-at-least-once", options, config)
+
+export const layerStrictFromConfig = <E, R>(
+  options: HatchetWorkerOptions<E, R>
+): Layer.Layer<never, E | HatchetError | Config.ConfigError, Exclude<R, WorkflowEngine.WorkflowEngine | HatchetRuntime>> =>
+  Layer.unwrap(configFromEnv.pipe(Effect.map((config) => layerStrict(options, config))))
+
+export const layerRunToCompletionFromConfig = <E, R>(
+  options: HatchetWorkerOptions<E, R>
+): Layer.Layer<never, E | HatchetError | Config.ConfigError, Exclude<R, WorkflowEngine.WorkflowEngine | HatchetRuntime>> =>
+  Layer.unwrap(configFromEnv.pipe(Effect.map((config) => layerRunToCompletion(options, config))))

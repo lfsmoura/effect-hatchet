@@ -1,0 +1,13 @@
+title: effect-hatchet
+description: Hatchet as an execution backend for Effect workflows
+url: https://leomoura.org
+baseurl: /effect-hatchet
+repository: lfsmoura/effect-hatchet
+theme: minima
+header_pages:
+  - usage.md
+  - development.md
+  - architecture.md
+exclude:
+  - Gemfile
+  - Gemfile.lock

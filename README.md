@@ -2,6 +2,8 @@
 
 Proof of concept: **Hatchet as an execution backend for Effect's `Workflow` API**.
 
+[Developer documentation](https://leomoura.org/effect-hatchet/)
+
 Application code uses Effect's own workflow abstractions (`effect/unstable/workflow`,
 Effect `4.0.0-rc`). Hatchet is an infrastructure detail that only appears in
 bootstrap code.
@@ -75,7 +77,7 @@ export const ProcessInvoiceLive = ProcessInvoice.toLayer(
 
 | Step construct | Maps to | Durability |
 | --- | --- | --- |
-| `Activity.make` | inline step in the parent's Hatchet run | **non-durable**: named + schema'd, but re-runs if the whole workflow re-runs (no replay memoization) |
+| `Activity.make` | rejected in strict mode; inline step in run-to-completion mode | **at-least-once** when explicitly enabled: named + schema'd, but re-runs if the whole workflow re-runs (no replay memoization) |
 | child `Workflow.execute` (`ProcessLineItem`) | its own Hatchet run | **durable**: result persisted server-side; deterministic idempotency key means duplicate dispatches join instead of double-posting |
 
 Fan-out/join is plain Effect: `Effect.forkChild` + `Effect.all` + `Fiber.join`.
@@ -96,20 +98,25 @@ const program = Effect.gen(function*() {
 Only infrastructure code selects the backend:
 
 ```ts
-// client process
-program.pipe(Effect.provide(HatchetWorkflowEngine.layer()))
+// client process: explicitly opt into inline, at-least-once activities
+program.pipe(
+  Effect.provide(HatchetWorkflowEngine.layerRunToCompletionFromConfig)
+)
 
-// worker process
-const MainLive = HatchetWorker.layer({ name: "erp-worker" }).pipe(
-  Layer.provide(ProcessInvoiceLive),      // registers workflows with the engine
-  Layer.provide(InvoiceService.layer),    // app services reach the handlers here
-  Layer.provideMerge(HatchetWorkflowEngine.layer())
+// worker process: registration order is encoded by the constructor
+const MainLive = HatchetWorker.layerRunToCompletionFromConfig({
+  name: "erp-worker",
+  workflows: Layer.mergeAll(ProcessInvoiceLive, ProcessLineItemLive)
+}).pipe(
+  Layer.provide(Layer.mergeAll(InvoiceService.layer, LedgerService.layer))
 )
 Effect.runPromise(Layer.launch(MainLive))
 ```
 
-Swapping `HatchetWorkflowEngine.layer()` for `WorkflowEngine.layerMemory` (or
-`ClusterWorkflowEngine.layer`) requires no changes to application code.
+Use `layerStrictFromConfig` for workflows that do not call `Activity.make`; it
+rejects activities and durable-suspension features explicitly. Swapping the
+Hatchet engine for `WorkflowEngine.layerMemory` or `ClusterWorkflowEngine.layer`
+still requires no workflow or business-code changes.
 
 ## Running it
 

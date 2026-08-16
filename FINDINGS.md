@@ -51,16 +51,17 @@ real-Hatchet tests pass:
 - typed workflow errors cross the boundary inside the encoded exit while the
   Hatchet run is *successful* (application failure ≠ infra failure);
 - concurrent duplicate `execute`s join a single Hatchet run;
-- multi-step workflows: `Activity.make` steps run inline, and **child
+- multi-step workflows in explicit run-to-completion mode: `Activity.make`
+  steps run inline, and **child
   workflows** (`ProcessLineItem.execute` inside `ProcessInvoice`) fan out as
   independent Hatchet runs — the parent forks them, keeps working, then joins
   all children with `Fiber.join` (`makeUnsafe` handles the parent-child
   linkage; child dedup works through the same idempotency keys).
 
-The viable subset is: `register`, `execute` (incl. discard), `poll`,
-`interrupt`/`interruptUnsafe`, and non-durable `activityExecute`. The
-suspension-related surface (`resume`, `deferredResult`, `deferredDone`,
-`scheduleClock`) is implemented as loud defects.
+The strict viable subset is `register`, `execute` (including discard), `poll`,
+and `interrupt`/`interruptUnsafe`; unsupported capabilities fail with structured
+defects. Run-to-completion mode additionally enables non-durable, at-least-once
+`activityExecute`.
 
 ## 2. What mapped cleanly?
 
@@ -94,11 +95,11 @@ Cluster gets this from `MessageStorage`; Hatchet's durability is per-*task*
 Hatchet's SDK), and it exposes no per-key storage an external engine could use
 to checkpoint arbitrary workflow state. Consequences in this PoC:
 
-- `Workflow.resume`, `DurableDeferred`, `DurableClock` → defect with a clear message.
-- `Activity` executes inline and is **not** persisted; a workflow is durable at
-  the whole-run granularity (Hatchet retries/requeues re-run the entire
-  workflow, so engine-level `retries` is pinned to 0 and retry policy belongs
-  in the Effect code).
+- `Workflow.resume`, `DurableDeferred`, `DurableClock` → structured defect.
+- Strict mode rejects `Activity`; run-to-completion mode executes it inline
+  without persistence. A workflow is durable at the whole-run granularity
+  (Hatchet retries/requeues re-run the entire workflow, so engine-level
+  `retries` is pinned to 0 and retry policy belongs in the Effect code).
 - A cancelled Hatchet run surfaces as an interrupted exit, but the
   interrupt-during-suspension dance cluster does has no equivalent.
 - Child-workflow durability is bounded by idempotency-key lifetime: a parent
@@ -129,16 +130,15 @@ not activity *execution* but activity *result storage*.
 
 No. `grep -ri hatchet example/erp/` is empty; the example workflow definition,
 implementation, and service are pure Effect. Hatchet appears in exactly two
-bootstrap files (`example/Main.ts`, `example/Worker.ts`) via
-`HatchetWorkflowEngine.layer()` / `HatchetWorker.layer(...)`, and the unit
-tests swap the backend without touching business code.
+bootstrap files (`example/Main.ts`, `example/Worker.ts`) via the explicit
+run-to-completion engine and worker layers; unit tests swap the backend without
+touching business code.
 
-One structural addition Effect doesn't have: a separate `HatchetWorker.layer`
-that must be composed *on top of* the workflow layers (so registrations happen
-before the worker starts). Cluster avoids this because its runner accepts
-dynamic entity registration; Hatchet workers want their workflow list at
-startup. It's still pure Layer composition, but it is one Hatchet-shaped
-constraint visible in bootstrap.
+One structural addition Effect does not need is a separate Hatchet worker
+layer. Its `workflows` option accepts the implementation Layers and guarantees
+that they register before the worker starts. Cluster avoids this concern because
+its runner accepts dynamic entity registration; Hatchet workers require their
+workflow list at startup. The constraint remains isolated to bootstrap.
 
 ## 5. How are Effect Layers/Context provided inside workers?
 
