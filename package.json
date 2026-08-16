@@ -1,10 +1,24 @@
 {
   "name": "effect-hatchet",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "private": true,
   "type": "module",
+  "files": [
+    "dist"
+  ],
+  "exports": {
+    "./workflow-engine": {
+      "types": "./dist/HatchetWorkflowEngine.d.ts",
+      "import": "./dist/HatchetWorkflowEngine.js"
+    },
+    "./worker": {
+      "types": "./dist/HatchetWorker.d.ts",
+      "import": "./dist/HatchetWorker.js"
+    }
+  },
   "description": "PoC: Hatchet as a backend for Effect's WorkflowEngine",
   "scripts": {
+    "build": "rm -rf dist && bun build src/HatchetWorkflowEngine.ts src/HatchetWorker.ts --outdir dist --target bun --format esm --packages external && tsc -p tsconfig.build.json",
     "typecheck": "tsc --noEmit",
     "test": "vitest run test/HatchetWorkflowEngine.test.ts",
     "test:e2e": "vitest run test/e2e.test.ts",

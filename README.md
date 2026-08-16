@@ -166,6 +166,13 @@ test/
   e2e.test.ts                    # real Hatchet round trip
 ```
 
+## Releases
+
+Every pull request to `main` must advance the semantic version in `package.json`
+and commit the output of `bun run build`. After the pull request is merged,
+GitHub Actions creates a `v<version>` release containing the built `dist/`
+directory and `package.json`.
+
 ## Findings
 
 See [FINDINGS.md](./FINDINGS.md) for the verdict on whether Hatchet can
