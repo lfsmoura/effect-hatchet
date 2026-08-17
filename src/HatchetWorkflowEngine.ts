@@ -114,7 +114,7 @@ const make: Effect.Effect<WorkflowEngine.WorkflowEngine["Service"], never, Hatch
             client.runs.list({
               workflowNames: [workflow._tag],
               additionalMetadata: { executionId },
-              since: new Date(Date.now() - 24 * 60 * 60 * 1000)
+              since: new Date(Date.now() - config.idempotencyFallbackTtlMs)
             }),
           catch: toHatchetError("Poll")
         })
