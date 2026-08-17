@@ -29,13 +29,31 @@ interface FakeRun {
   error?: string
 }
 
+interface PersistedRun {
+  readonly id: string
+  readonly workflowName: string
+  readonly executionId: string
+  readonly createdAt: Date
+}
+
+interface RunListOptions {
+  readonly workflowNames: ReadonlyArray<string>
+  readonly additionalMetadata: { readonly executionId: string }
+  readonly since: Date
+}
+
 /** Minimal in-memory stand-in for the Hatchet server + SDK. */
 const makeFakeHatchet = (workerFailure?: Error) => {
   const fns = new Map<string, (input: any, ctx: any) => Promise<any>>()
   const runs = new Map<string, FakeRun>()
+  const persistedRuns: Array<PersistedRun> = []
   const byIdempotencyKey = new Map<string, string>()
   let counter = 0
   const workerState = { starts: 0, stops: 0 }
+  const seedRun = (record: PersistedRun, run: FakeRun = { status: "RUNNING" }) => {
+    persistedRuns.push(record)
+    runs.set(record.id, run)
+  }
 
   const start = (name: string, input: any): string => {
     // Simulates Hatchet's status-based idempotency on `input.executionId`:
@@ -44,6 +62,12 @@ const makeFakeHatchet = (workerFailure?: Error) => {
     if (existing !== undefined) return existing
     const runId = `run-${++counter}`
     byIdempotencyKey.set(input.executionId, runId)
+    persistedRuns.push({
+      id: runId,
+      workflowName: name,
+      executionId: input.executionId,
+      createdAt: new Date()
+    })
     const fn = fns.get(name)
     if (fn === undefined) {
       runs.set(runId, { status: "FAILED", error: `workflow ${name} not registered with any worker` })
@@ -99,10 +123,18 @@ const makeFakeHatchet = (workerFailure?: Error) => {
           }
         }
       },
-      list: async () => ({ rows: [] })
+      list: async ({ workflowNames, additionalMetadata, since }: RunListOptions) => ({
+        rows: persistedRuns
+          .filter((run) =>
+            workflowNames.includes(run.workflowName) &&
+            run.executionId === additionalMetadata.executionId &&
+            run.createdAt >= since
+          )
+          .map((run) => ({ metadata: { id: run.id } }))
+      })
     }
   }
-  return { client: client as any, runs, workerState }
+  return { client: client as any, runs, seedRun, workerState }
 }
 
 const makeTestLayer = () => {
@@ -167,6 +199,25 @@ describe("HatchetWorkflowEngine", () => {
     expect(fake.runs.size).toBe(4)
     expect(a.id).toBe(7)
     expect(b.id).toBe(7)
+  })
+
+  it("recovers and interrupts a run within the configured idempotency TTL after restart", async () => {
+    const fake = makeFakeHatchet()
+    const executionId = "import-123"
+    fake.seedRun({
+      id: "run-1",
+      workflowName: ProcessInvoice._tag,
+      executionId,
+      createdAt: new Date(Date.now() - 30 * 60 * 60 * 1000)
+    })
+    const engineLayer = HatchetWorkflowEngine.layerRunToCompletion({
+      client: fake.client,
+      idempotencyFallbackTtl: "72 hours"
+    })
+
+    await Effect.runPromise(ProcessInvoice.interrupt(executionId).pipe(Effect.provide(engineLayer)))
+
+    expect(fake.runs.get("run-1")?.status).toBe("CANCELLED")
   })
 
   it("surfaces Hatchet infrastructure failures as defects, not typed errors", async () => {
