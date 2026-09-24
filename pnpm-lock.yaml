@@ -9,8 +9,8 @@ importers:
   .:
     dependencies:
       '@hatchet-dev/typescript-sdk':
-        specifier: ^1.28.2
-        version: 1.28.2(@grpc/grpc-js@1.14.4)(zod@4.4.3)
+        specifier: ^1.33.2
+        version: 1.33.2(@grpc/grpc-js@1.14.4)(zod@4.4.3)
       effect:
         specifier: 4.0.0-rc.117
         version: 4.0.0-rc.117
@@ -195,8 +195,9 @@ packages:
     engines: {node: '>=6'}
     hasBin: true
 
-  '@hatchet-dev/typescript-sdk@1.28.2':
-    resolution: {integrity: sha512-L7OJTQvHMpconB9hGv67zg/pcpm04TODw6Kmo05U+jR0WHBBcVrepe/VlxxdXoNSgowOawpYnmA3jpgKKo+8dA==}
+  '@hatchet-dev/typescript-sdk@1.33.2':
+    resolution: {integrity: sha512-OSLYGK8inrWfB3N9bepAcjpCZSFEYjpMPPp9f/iX9CD6V5XAl/O4FZoPblgUBN9MJj9k1/6XBGZJFLyZQiDHsA==}
+    engines: {node: '>=20'}
     peerDependencies:
       '@anthropic-ai/claude-agent-sdk': ^0.3.148
       '@grpc/grpc-js': ^1.14.3
@@ -712,8 +713,8 @@ packages:
     resolution: {integrity: sha512-cJ+oHTW1VAEa8cJslgmUZrc+sjRKgAKl3Zyse6+PV38hZe/V6Z14TbCuXcan9F9ghlz4QrFr2c92TNF82UkYHA==}
     engines: {node: '>=10'}
 
-  qs@6.15.3:
-    resolution: {integrity: sha512-O9gl3zCl5h5blw1KGUzQKhA5oUXSl8rwUIM5o0S3nCXMliSvy5Dzx7/DJcI+SwgICv+IneSZwhBh1oSyEHA71A==}
+  qs@6.16.0:
+    resolution: {integrity: sha512-h6fhOIaRrID2CbEY2fqs+7t+UXZo+MLAnU5gRIq85uFtdiUPCdsApMlHhXogKVM4HM2DVbIjGNTTYH2OcmP1vA==}
     engines: {node: '>=0.6'}
 
   require-directory@2.1.1:
@@ -1009,7 +1010,7 @@ snapshots:
       protobufjs: 7.6.5
       yargs: 17.7.3
 
-  '@hatchet-dev/typescript-sdk@1.28.2(@grpc/grpc-js@1.14.4)(zod@4.4.3)':
+  '@hatchet-dev/typescript-sdk@1.33.2(@grpc/grpc-js@1.14.4)(zod@4.4.3)':
     dependencies:
       '@bufbuild/protobuf': 2.14.0
       '@types/qs': 6.15.1
@@ -1019,7 +1020,7 @@ snapshots:
       nice-grpc: 2.1.17
       nice-grpc-common: 2.0.4
       protobufjs: 7.6.5
-      qs: 6.15.3
+      qs: 6.16.0
       semver: 7.8.5
       yaml: 2.9.0
       zod: 4.4.3
@@ -1453,7 +1454,7 @@ snapshots:
 
   proxy-from-env@2.1.0: {}
 
-  qs@6.15.3:
+  qs@6.16.0:
     dependencies:
       es-define-property: 1.0.1
       side-channel: 1.1.1
