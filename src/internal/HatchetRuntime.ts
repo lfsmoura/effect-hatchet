@@ -2,7 +2,7 @@ import type {
   HatchetClient as HatchetClientType,
   JsonObject,
   TaskWorkflowDeclaration
-} from "@hatchet-dev/typescript-sdk/v1"
+} from "@hatchet-dev/typescript-sdk/v1/index.js"
 import { Context } from "effect"
 import type { RunInput } from "./serialization.ts"
 

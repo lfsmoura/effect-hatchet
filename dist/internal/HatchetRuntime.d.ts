@@ -1,4 +1,4 @@
-import type { HatchetClient as HatchetClientType, JsonObject, TaskWorkflowDeclaration } from "@hatchet-dev/typescript-sdk/v1";
+import type { HatchetClient as HatchetClientType, JsonObject, TaskWorkflowDeclaration } from "@hatchet-dev/typescript-sdk/v1/index.js";
 import { Context } from "effect";
 import type { RunInput } from "./serialization.ts";
 export type ActivityMode = "strict" | "inline-at-least-once";

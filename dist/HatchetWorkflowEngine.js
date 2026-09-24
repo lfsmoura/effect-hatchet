@@ -1,6 +1,6 @@
 // @bun
 // src/HatchetWorkflowEngine.ts
-import { HatchetClient, IdempotencyCollisionError } from "@hatchet-dev/typescript-sdk/v1";
+import { HatchetClient, IdempotencyCollisionError } from "@hatchet-dev/typescript-sdk/v1/index.js";
 import { Cause, Config, Duration, Effect as Effect2, Exit, Layer, Option, Redacted, Schedule } from "effect";
 import { Workflow as Workflow2, WorkflowEngine } from "effect/unstable/workflow";
 
@@ -86,11 +86,11 @@ var unwrapTaskOutput = (workflowName, output) => {
 
 // src/HatchetWorkflowEngine.ts
 var EnvironmentConfig = Config.all({
-  token: Config.redacted("HATCHET_CLIENT_TOKEN"),
-  hostPort: Config.option(Config.string("HATCHET_CLIENT_HOST_PORT")),
-  tlsStrategy: Config.option(Config.literals(["tls", "mtls", "none"], "HATCHET_CLIENT_TLS_STRATEGY")),
-  idempotencyFallbackTtl: Config.duration("HATCHET_IDEMPOTENCY_FALLBACK_TTL").pipe(Config.withDefault(Duration.hours(24))),
-  resultPollInterval: Config.duration("HATCHET_RESULT_POLL_INTERVAL").pipe(Config.withDefault(Duration.millis(300)))
+  token: Config.Redacted("HATCHET_CLIENT_TOKEN"),
+  hostPort: Config.option(Config.String("HATCHET_CLIENT_HOST_PORT")),
+  tlsStrategy: Config.option(Config.Literals(["tls", "mtls", "none"], "HATCHET_CLIENT_TLS_STRATEGY")),
+  idempotencyFallbackTtl: Config.Duration("HATCHET_IDEMPOTENCY_FALLBACK_TTL").pipe(Config.withDefault(Duration.hours(24))),
+  resultPollInterval: Config.Duration("HATCHET_RESULT_POLL_INTERVAL").pipe(Config.withDefault(Duration.millis(300)))
 });
 var configFromEnv = EnvironmentConfig.pipe(Effect2.map((config) => ({
   token: config.token,
@@ -277,10 +277,10 @@ var layerRunToCompletion = (config = {}) => publicLayer("inline-at-least-once", 
 var layerStrictFromConfig = Layer.unwrap(configFromEnv.pipe(Effect2.map(layerStrict)));
 var layerRunToCompletionFromConfig = Layer.unwrap(configFromEnv.pipe(Effect2.map(layerRunToCompletion)));
 export {
-  layerStrictFromConfig,
-  layerStrict,
-  layerRunToCompletionFromConfig,
-  layerRunToCompletion,
+  configFromEnv,
   layerInternal,
-  configFromEnv
+  layerRunToCompletion,
+  layerRunToCompletionFromConfig,
+  layerStrict,
+  layerStrictFromConfig
 };

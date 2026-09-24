@@ -114,13 +114,13 @@ selects Hatchet as the engine.
 In one terminal, with the Hatchet environment variables exported:
 
 ```sh
-pnpm tsx example/TutorialWorker.ts
+node example/TutorialWorker.ts
 ```
 
 In a second terminal with the same variables:
 
 ```sh
-pnpm tsx example/TutorialClient.ts
+node example/TutorialClient.ts
 ```
 
 The client logs `Hello, Ada!`. The run also appears in the local Hatchet

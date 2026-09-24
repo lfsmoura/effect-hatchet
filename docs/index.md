@@ -20,6 +20,6 @@ Business code → Effect Workflow → WorkflowEngine → HatchetWorkflowEngine �
 
 ## Current status
 
-This repository is a proof of concept against `effect@4.0.0-rc.109` and
+This repository is a proof of concept against `effect@4.0.0-rc.117` and
 `@hatchet-dev/typescript-sdk@1.28.2`. The execute, register, poll, interrupt,
 and child-workflow paths are implemented. Durable suspension is not.

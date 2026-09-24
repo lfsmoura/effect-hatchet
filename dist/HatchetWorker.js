@@ -1,6 +1,9 @@
 // @bun
+// src/HatchetWorker.ts
+import { Duration as Duration2, Effect as Effect3, Layer as Layer2 } from "effect";
+
 // src/HatchetWorkflowEngine.ts
-import { HatchetClient, IdempotencyCollisionError } from "@hatchet-dev/typescript-sdk/v1";
+import { HatchetClient, IdempotencyCollisionError } from "@hatchet-dev/typescript-sdk/v1/index.js";
 import { Cause, Config, Duration, Effect as Effect2, Exit, Layer, Option, Redacted, Schedule } from "effect";
 import { Workflow as Workflow2, WorkflowEngine } from "effect/unstable/workflow";
 
@@ -86,11 +89,11 @@ var unwrapTaskOutput = (workflowName, output) => {
 
 // src/HatchetWorkflowEngine.ts
 var EnvironmentConfig = Config.all({
-  token: Config.redacted("HATCHET_CLIENT_TOKEN"),
-  hostPort: Config.option(Config.string("HATCHET_CLIENT_HOST_PORT")),
-  tlsStrategy: Config.option(Config.literals(["tls", "mtls", "none"], "HATCHET_CLIENT_TLS_STRATEGY")),
-  idempotencyFallbackTtl: Config.duration("HATCHET_IDEMPOTENCY_FALLBACK_TTL").pipe(Config.withDefault(Duration.hours(24))),
-  resultPollInterval: Config.duration("HATCHET_RESULT_POLL_INTERVAL").pipe(Config.withDefault(Duration.millis(300)))
+  token: Config.Redacted("HATCHET_CLIENT_TOKEN"),
+  hostPort: Config.option(Config.String("HATCHET_CLIENT_HOST_PORT")),
+  tlsStrategy: Config.option(Config.Literals(["tls", "mtls", "none"], "HATCHET_CLIENT_TLS_STRATEGY")),
+  idempotencyFallbackTtl: Config.Duration("HATCHET_IDEMPOTENCY_FALLBACK_TTL").pipe(Config.withDefault(Duration.hours(24))),
+  resultPollInterval: Config.Duration("HATCHET_RESULT_POLL_INTERVAL").pipe(Config.withDefault(Duration.millis(300)))
 });
 var configFromEnv = EnvironmentConfig.pipe(Effect2.map((config) => ({
   token: config.token,
@@ -278,7 +281,6 @@ var layerStrictFromConfig = Layer.unwrap(configFromEnv.pipe(Effect2.map(layerStr
 var layerRunToCompletionFromConfig = Layer.unwrap(configFromEnv.pipe(Effect2.map(layerRunToCompletion)));
 
 // src/HatchetWorker.ts
-import { Duration as Duration2, Effect as Effect3, Layer as Layer2 } from "effect";
 var workerLayer = (options) => Layer2.effectDiscard(Effect3.gen(function* () {
   const state = yield* HatchetRuntime;
   if (state.tasks.size === 0) {
@@ -290,7 +292,7 @@ var workerLayer = (options) => Layer2.effectDiscard(Effect3.gen(function* () {
       slots: options.slots ?? 100
     }),
     catch: toHatchetError("Worker")
-  }), (worker2) => Effect3.promise(() => worker2.stop()).pipe(Effect3.ignore));
+  }), (worker) => Effect3.promise(() => worker.stop()).pipe(Effect3.ignore));
   yield* Effect3.tryPromise({
     try: () => worker.start(),
     catch: toHatchetError("Worker")
@@ -308,8 +310,8 @@ var layerRunToCompletion2 = (options, config = {}) => layerWithMode("inline-at-l
 var layerStrictFromConfig2 = (options) => Layer2.unwrap(configFromEnv.pipe(Effect3.map((config) => layerStrict2(options, config))));
 var layerRunToCompletionFromConfig2 = (options) => Layer2.unwrap(configFromEnv.pipe(Effect3.map((config) => layerRunToCompletion2(options, config))));
 export {
-  layerStrictFromConfig2 as layerStrictFromConfig,
-  layerStrict2 as layerStrict,
+  layerRunToCompletion2 as layerRunToCompletion,
   layerRunToCompletionFromConfig2 as layerRunToCompletionFromConfig,
-  layerRunToCompletion2 as layerRunToCompletion
+  layerStrict2 as layerStrict,
+  layerStrictFromConfig2 as layerStrictFromConfig
 };

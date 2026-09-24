@@ -8,8 +8,8 @@ import type {
   HatchetClient as HatchetClientType,
   JsonObject,
   RunDetail
-} from "@hatchet-dev/typescript-sdk/v1"
-import { HatchetClient, IdempotencyCollisionError } from "@hatchet-dev/typescript-sdk/v1"
+} from "@hatchet-dev/typescript-sdk/v1/index.js"
+import { HatchetClient, IdempotencyCollisionError } from "@hatchet-dev/typescript-sdk/v1/index.js"
 import { Cause, Config, Duration, Effect, Exit, Layer, Option, Redacted, Schedule } from "effect"
 import { Workflow, WorkflowEngine } from "effect/unstable/workflow"
 import {
@@ -35,15 +35,15 @@ export interface HatchetConfig {
 }
 
 const EnvironmentConfig = Config.all({
-  token: Config.redacted("HATCHET_CLIENT_TOKEN"),
-  hostPort: Config.option(Config.string("HATCHET_CLIENT_HOST_PORT")),
+  token: Config.Redacted("HATCHET_CLIENT_TOKEN"),
+  hostPort: Config.option(Config.String("HATCHET_CLIENT_HOST_PORT")),
   tlsStrategy: Config.option(
-    Config.literals(["tls", "mtls", "none"], "HATCHET_CLIENT_TLS_STRATEGY")
+    Config.Literals(["tls", "mtls", "none"], "HATCHET_CLIENT_TLS_STRATEGY")
   ),
-  idempotencyFallbackTtl: Config.duration("HATCHET_IDEMPOTENCY_FALLBACK_TTL").pipe(
+  idempotencyFallbackTtl: Config.Duration("HATCHET_IDEMPOTENCY_FALLBACK_TTL").pipe(
     Config.withDefault(Duration.hours(24))
   ),
-  resultPollInterval: Config.duration("HATCHET_RESULT_POLL_INTERVAL").pipe(
+  resultPollInterval: Config.Duration("HATCHET_RESULT_POLL_INTERVAL").pipe(
     Config.withDefault(Duration.millis(300))
   )
 })

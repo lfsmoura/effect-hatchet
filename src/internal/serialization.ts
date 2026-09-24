@@ -1,4 +1,4 @@
-import type { JsonObject, JsonValue } from "@hatchet-dev/typescript-sdk/v1"
+import type { JsonObject, JsonValue } from "@hatchet-dev/typescript-sdk/v1/index.js"
 import { Effect, Schema } from "effect"
 import { Workflow } from "effect/unstable/workflow"
 

@@ -4,7 +4,7 @@
  * `layerStrict` rejects workflow capabilities that require durable replay.
  * `layerRunToCompletion` explicitly opts into inline, at-least-once activities.
  */
-import type { HatchetClient as HatchetClientType } from "@hatchet-dev/typescript-sdk/v1";
+import type { HatchetClient as HatchetClientType } from "@hatchet-dev/typescript-sdk/v1/index.js";
 import { Config, Duration, Effect, Layer, Redacted } from "effect";
 import { WorkflowEngine } from "effect/unstable/workflow";
 import { HatchetError } from "./internal/errors.ts";
