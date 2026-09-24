@@ -3,8 +3,12 @@
 import { Duration as Duration2, Effect as Effect3, Layer as Layer2 } from "effect";
 
 // src/HatchetWorkflowEngine.ts
-import { HatchetClient, IdempotencyCollisionError } from "@hatchet-dev/typescript-sdk/v1/index.js";
-import { Cause, Config, Duration, Effect as Effect2, Exit, Layer, Option, Redacted, Schedule } from "effect";
+import {
+  ConcurrencyLimitStrategy as HatchetConcurrencyLimitStrategy,
+  HatchetClient,
+  IdempotencyCollisionError
+} from "@hatchet-dev/typescript-sdk/v1/index.js";
+import { Cause, Config, Context as Context2, Duration, Effect as Effect2, Exit, Layer, Option, Redacted, Schedule } from "effect";
 import { Workflow as Workflow2, WorkflowEngine } from "effect/unstable/workflow";
 
 // src/internal/errors.ts
@@ -88,6 +92,14 @@ var unwrapTaskOutput = (workflowName, output) => {
 };
 
 // src/HatchetWorkflowEngine.ts
+var Concurrency = Context2.Reference("effect-hatchet/HatchetWorkflowEngine/Concurrency", { defaultValue: () => [] });
+var toHatchetConcurrency = (rule) => ({
+  expression: rule.expression,
+  ...rule.maxRuns !== undefined ? { maxRuns: rule.maxRuns } : {},
+  ...rule.limitStrategy !== undefined ? { limitStrategy: HatchetConcurrencyLimitStrategy[rule.limitStrategy] } : {},
+  ...rule.name !== undefined ? { name: rule.name } : {},
+  ...rule.isTenantScoped === true ? { isTenantScoped: true } : {}
+});
 var EnvironmentConfig = Config.all({
   token: Config.Redacted("HATCHET_CLIENT_TOKEN"),
   hostPort: Config.option(Config.String("HATCHET_CLIENT_HOST_PORT")),
@@ -223,9 +235,11 @@ var make = Effect2.gen(function* () {
         return yield* Effect2.die(new Error(`Workflow ${workflow._tag} already registered`));
       }
       const codec = codecFor(workflow);
+      const concurrency = Context2.get(workflow.annotations, Concurrency);
       const task = state.client.task({
         name: workflow._tag,
         retries: 0,
+        ...concurrency.length > 0 ? { concurrency: concurrency.map(toHatchetConcurrency) } : {},
         idempotency: {
           expression: "input.executionId",
           strategy: "status",

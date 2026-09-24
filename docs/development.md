@@ -6,8 +6,8 @@ permalink: /development.html
 
 ## Prerequisites
 
-- Node.js and pnpm
-- Docker with Compose
+- Node.js and pnpm (`mise install` pins the pnpm version CI uses)
+- Docker with Compose, to run the examples against hatchet-lite
 
 ## Install
 
@@ -54,12 +54,17 @@ pnpm typecheck
 pnpm test
 ```
 
-The end-to-end suite requires the local Hatchet services and token configured
-above:
+The end-to-end suite runs against a real Hatchet engine:
 
 ```sh
 pnpm test:e2e
 ```
+
+With `HATCHET_CLIENT_TOKEN` set or a `.hatchet-token` file present, it uses
+that engine, such as the docker-compose hatchet-lite above. Otherwise
+`test/e2e.setup.ts` starts Hatchet's embedded engine with a bundled Postgres.
+The engine binary is downloaded and cached under `~/.hatchet/embedded` on first
+use, so the suite needs neither Docker nor a token. CI runs it this way.
 
 ## Project layout
 
@@ -75,4 +80,5 @@ example/
 test/
   HatchetWorkflowEngine.test.ts
   e2e.test.ts
+  e2e.setup.ts              embedded engine for the e2e suite
 ```

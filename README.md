@@ -136,13 +136,18 @@ Dashboard: http://localhost:8888 (admin@example.com / Admin123!!).
 
 ```sh
 pnpm test        # boundary tests against a mocked Hatchet client
-pnpm test:e2e    # real round trip through dockerized Hatchet (needs token, see above)
+pnpm test:e2e    # real round trip through Hatchet (embedded engine, or dockerized with a token)
 ```
+
+Without `HATCHET_CLIENT_TOKEN` or `.hatchet-token`, `pnpm test:e2e` starts
+Hatchet's embedded engine (downloaded once to `~/.hatchet/embedded`), so no
+Docker is needed.
 
 The e2e suite proves: real dispatch → Hatchet server → worker → Effect runtime →
 Layer-provided services → typed result/error back to the caller; the parent run
 fans out three real `ProcessLineItem` child runs and joins them; concurrent
-duplicate executions (parents *and* children) join a single run each.
+duplicate executions (parents *and* children) join a single run each; a
+`Concurrency` annotation cancels queued runs except the newest.
 
 ## Layout
 
@@ -164,6 +169,7 @@ example/
 test/
   HatchetWorkflowEngine.test.ts  # mocked-Hatchet boundary tests
   e2e.test.ts                    # real Hatchet round trip
+  e2e.setup.ts                   # embedded engine unless a token is configured
 ```
 
 ## Releases

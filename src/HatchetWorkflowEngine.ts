@@ -5,12 +5,17 @@
  * `layerRunToCompletion` explicitly opts into inline, at-least-once activities.
  */
 import type {
+  Concurrency as HatchetConcurrency,
   HatchetClient as HatchetClientType,
   JsonObject,
   RunDetail
 } from "@hatchet-dev/typescript-sdk/v1/index.js"
-import { HatchetClient, IdempotencyCollisionError } from "@hatchet-dev/typescript-sdk/v1/index.js"
-import { Cause, Config, Duration, Effect, Exit, Layer, Option, Redacted, Schedule } from "effect"
+import {
+  ConcurrencyLimitStrategy as HatchetConcurrencyLimitStrategy,
+  HatchetClient,
+  IdempotencyCollisionError
+} from "@hatchet-dev/typescript-sdk/v1/index.js"
+import { Cause, Config, Context, Duration, Effect, Exit, Layer, Option, Redacted, Schedule } from "effect"
 import { Workflow, WorkflowEngine } from "effect/unstable/workflow"
 import {
   HatchetError,
@@ -33,6 +38,65 @@ export interface HatchetConfig {
   /** Interval for polling run results. Defaults to 300 millis. */
   readonly resultPollInterval?: Duration.Input
 }
+
+/** What Hatchet does with new runs when a concurrency group is at its limit. */
+export type ConcurrencyLimitStrategy =
+  | "CANCEL_IN_PROGRESS"
+  | "CANCEL_NEWEST"
+  | "GROUP_ROUND_ROBIN"
+  | "CANCEL_QUEUED_EXCEPT_NEWEST"
+  | "CANCEL_QUEUED_EXCEPT_OLDEST"
+
+interface ConcurrencyRuleBase {
+  /**
+   * CEL expression computing the concurrency group key. The workflow payload
+   * is available as `input.payload`, in its schema-encoded form, e.g.
+   * `"input.payload.customerId"`.
+   */
+  readonly expression: string
+  /**
+   * Maximum concurrent runs per group: a number, or a CEL expression over the
+   * same input. Hatchet defaults to 1.
+   */
+  readonly maxRuns?: number | string
+  /** Hatchet defaults to `CANCEL_IN_PROGRESS`. */
+  readonly limitStrategy?: ConcurrencyLimitStrategy
+}
+
+/**
+ * A Hatchet concurrency rule. Tenant-scoped rules share one limit across every
+ * workflow that declares the same `name`.
+ */
+export type ConcurrencyRule = ConcurrencyRuleBase & (
+  | { readonly isTenantScoped?: false; readonly name?: string }
+  | { readonly isTenantScoped: true; readonly name: string }
+)
+
+/**
+ * Workflow annotation that registers Hatchet concurrency rules, applied in
+ * order. Runs cancelled by a rule complete as interrupted.
+ *
+ * ```ts
+ * const SyncCustomer = Workflow.make("SyncCustomer", { ... }).annotate(
+ *   HatchetWorkflowEngine.Concurrency,
+ *   [{ expression: "input.payload.customerId", maxRuns: 1, limitStrategy: "CANCEL_QUEUED_EXCEPT_NEWEST" }]
+ * )
+ * ```
+ */
+export const Concurrency = Context.Reference<ReadonlyArray<ConcurrencyRule>>(
+  "effect-hatchet/HatchetWorkflowEngine/Concurrency",
+  { defaultValue: () => [] }
+)
+
+const toHatchetConcurrency = (rule: ConcurrencyRule): HatchetConcurrency => ({
+  expression: rule.expression,
+  ...(rule.maxRuns !== undefined ? { maxRuns: rule.maxRuns } : {}),
+  ...(rule.limitStrategy !== undefined
+    ? { limitStrategy: HatchetConcurrencyLimitStrategy[rule.limitStrategy] }
+    : {}),
+  ...(rule.name !== undefined ? { name: rule.name } : {}),
+  ...(rule.isTenantScoped === true ? { isTenantScoped: true } : {})
+})
 
 const EnvironmentConfig = Config.all({
   token: Config.Redacted("HATCHET_CLIENT_TOKEN"),
@@ -231,9 +295,11 @@ const make: Effect.Effect<WorkflowEngine.WorkflowEngine["Service"], never, Hatch
             return yield* Effect.die(new Error(`Workflow ${workflow._tag} already registered`))
           }
           const codec = codecFor(workflow)
+          const concurrency = Context.get(workflow.annotations, Concurrency)
           const task = state.client.task<RunInput, JsonObject>({
             name: workflow._tag,
             retries: 0,
+            ...(concurrency.length > 0 ? { concurrency: concurrency.map(toHatchetConcurrency) } : {}),
             idempotency: {
               expression: "input.executionId",
               strategy: "status",

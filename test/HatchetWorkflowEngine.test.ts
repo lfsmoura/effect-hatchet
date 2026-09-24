@@ -7,13 +7,14 @@
  *   dispatch → task handler → Effect runtime → workflow implementation →
  *   Layer-provided InvoiceService → encoded result → decoded typed result.
  */
-import { Cause, ConfigProvider, Duration, Effect, Exit, Layer, Redacted, Result } from "effect"
+import { ConcurrencyLimitStrategy } from "@hatchet-dev/typescript-sdk/v1/index.js"
+import { Cause, ConfigProvider, Duration, Effect, Exit, Layer, Redacted, Result, Schema } from "effect"
 
 const firstError = (cause: Cause.Cause<unknown>): unknown => {
   const found = Cause.findError(cause)
   return Result.isSuccess(found) ? found.success : undefined
 }
-import { WorkflowEngine } from "effect/unstable/workflow"
+import { Workflow, WorkflowEngine } from "effect/unstable/workflow"
 import { describe, expect, it } from "vitest"
 import { InvoiceNotFound, InvoiceService } from "../example/erp/InvoiceService.ts"
 import { LedgerService } from "../example/erp/LedgerService.ts"
@@ -45,6 +46,7 @@ interface RunListOptions {
 /** Minimal in-memory stand-in for the Hatchet server + SDK. */
 const makeFakeHatchet = (workerFailure?: Error) => {
   const fns = new Map<string, (input: any, ctx: any) => Promise<any>>()
+  const taskOptions = new Map<string, any>()
   const runs = new Map<string, FakeRun>()
   const persistedRuns: Array<PersistedRun> = []
   const byIdempotencyKey = new Map<string, string>()
@@ -84,6 +86,7 @@ const makeFakeHatchet = (workerFailure?: Error) => {
   const client = {
     task: (opts: any) => {
       fns.set(opts.name, opts.fn)
+      taskOptions.set(opts.name, opts)
       return {
         runNoWait: async (input: any) => ({ runId: Promise.resolve(start(opts.name, input)) })
       }
@@ -134,7 +137,7 @@ const makeFakeHatchet = (workerFailure?: Error) => {
       })
     }
   }
-  return { client: client as any, runs, seedRun, workerState }
+  return { client: client as any, runs, seedRun, taskOptions, workerState }
 }
 
 const makeTestLayer = () => {
@@ -322,5 +325,50 @@ describe("HatchetWorkflowEngine", () => {
     expect(config.tlsStrategy).toBe("none")
     expect(Duration.toMillis(config.idempotencyFallbackTtl)).toBe(3_600_000)
     expect(Duration.toMillis(config.resultPollInterval)).toBe(2_000)
+  })
+
+  it("registers Hatchet concurrency rules from the workflow annotation", async () => {
+    const SyncCustomer = Workflow.make("SyncCustomer", {
+      payload: { customerId: Schema.String },
+      success: Schema.String,
+      idempotencyKey: ({ customerId }) => customerId
+    }).annotate(HatchetWorkflowEngine.Concurrency, [
+      {
+        expression: "input.payload.customerId",
+        maxRuns: 1,
+        limitStrategy: "CANCEL_QUEUED_EXCEPT_NEWEST"
+      },
+      {
+        expression: "'crm'",
+        maxRuns: "input.payload.customerId == 'vip' ? 10 : 2",
+        name: "crm-api",
+        isTenantScoped: true
+      }
+    ])
+    const fake = makeFakeHatchet()
+    const layer = Layer.mergeAll(
+      SyncCustomer.toLayer(({ customerId }) => Effect.succeed(customerId)),
+      ProcessLineItemLive
+    ).pipe(
+      Layer.provide(LedgerService.layer),
+      Layer.provideMerge(HatchetWorkflowEngine.layerRunToCompletion({ client: fake.client }))
+    )
+    await Effect.runPromise(Layer.build(layer).pipe(Effect.scoped))
+
+    expect(fake.taskOptions.get("SyncCustomer").concurrency).toEqual([
+      {
+        expression: "input.payload.customerId",
+        maxRuns: 1,
+        limitStrategy: ConcurrencyLimitStrategy.CANCEL_QUEUED_EXCEPT_NEWEST
+      },
+      {
+        expression: "'crm'",
+        maxRuns: "input.payload.customerId == 'vip' ? 10 : 2",
+        name: "crm-api",
+        isTenantScoped: true
+      }
+    ])
+    // Workflows without the annotation register no concurrency at all.
+    expect(fake.taskOptions.get("ProcessLineItem")).not.toHaveProperty("concurrency")
   })
 })

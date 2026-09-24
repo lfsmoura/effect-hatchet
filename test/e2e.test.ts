@@ -1,21 +1,20 @@
 /**
- * End-to-end test against a real local Hatchet (docker-compose.yml).
+ * End-to-end test against a real Hatchet engine.
  *
- *   docker compose up -d
- *   ./scripts/hatchet-token.sh
  *   pnpm test:e2e
+ *
+ * test/e2e.setup.ts starts an embedded Hatchet engine unless a token is
+ * configured (env HATCHET_CLIENT_TOKEN or the .hatchet-token file written by
+ * scripts/hatchet-token.sh for the docker-compose hatchet-lite).
  *
  * Proves the full round trip: an Effect client dispatches through the real
  * Hatchet server, a real Hatchet worker (in this process) receives the run,
  * re-enters the Effect runtime and executes the workflow with its
  * Layer-provided InvoiceService; the typed result travels back.
- *
- * Skipped when no token is available (env HATCHET_CLIENT_TOKEN or
- * .hatchet-token file).
  */
-import { Cause, Effect, Exit, Layer, Redacted, Result } from "effect"
-import { existsSync, readFileSync } from "node:fs"
-import { describe, expect, it } from "vitest"
+import { Cause, Effect, Exit, Fiber, Layer, Redacted, Result, Schema } from "effect"
+import { Workflow } from "effect/unstable/workflow"
+import { describe, expect, inject, it } from "vitest"
 import * as HatchetWorker from "../src/HatchetWorker.ts"
 import * as HatchetWorkflowEngine from "../src/HatchetWorkflowEngine.ts"
 import { InvoiceNotFound, InvoiceService } from "../example/erp/InvoiceService.ts"
@@ -23,14 +22,11 @@ import { LedgerService } from "../example/erp/LedgerService.ts"
 import { ProcessInvoice, ProcessInvoiceLive } from "../example/erp/ProcessInvoice.ts"
 import { ProcessLineItemLive } from "../example/erp/ProcessLineItem.ts"
 
-const tokenFile = new URL("../.hatchet-token", import.meta.url).pathname
-const token = process.env.HATCHET_CLIENT_TOKEN ??
-  (existsSync(tokenFile) ? readFileSync(tokenFile, "utf8").trim() : undefined)
-
-const describeE2e = token === undefined ? describe.skip : describe
+const hatchet = inject("hatchet")
 
 const config: HatchetWorkflowEngine.HatchetConfig = {
-  ...(token !== undefined ? { token: Redacted.make(token) } : {}),
+  token: Redacted.make(hatchet.token),
+  ...(hatchet.hostPort !== undefined ? { hostPort: hatchet.hostPort } : {}),
   tlsStrategy: "none",
   resultPollInterval: "250 millis"
 }
@@ -49,7 +45,7 @@ const WorkerLive = HatchetWorker.layerRunToCompletion({
 // process would.
 const ClientLive = HatchetWorkflowEngine.layerRunToCompletion(config)
 
-describeE2e("HatchetWorkflowEngine e2e", () => {
+describe("HatchetWorkflowEngine e2e", () => {
   it("dispatches through Hatchet to a worker that re-enters the Effect runtime", async () => {
     const invoiceId = 100_000 + Math.floor(Math.random() * 900_000)
     const program = Effect.gen(function*() {
@@ -107,4 +103,41 @@ describeE2e("HatchetWorkflowEngine e2e", () => {
       expect(error).toBeInstanceOf(InvoiceNotFound)
     }
   }, 120_000)
+
+  it("cancels queued runs except the newest under a concurrency annotation", async () => {
+    // One run per group at a time; a new arrival replaces whatever is queued.
+    const Throttled = Workflow.make("E2eThrottled", {
+      payload: { group: Schema.String, label: Schema.String },
+      success: Schema.String,
+      idempotencyKey: ({ group, label }) => `${group}:${label}`
+    }).annotate(HatchetWorkflowEngine.Concurrency, [{
+      expression: "input.payload.group",
+      maxRuns: 1,
+      limitStrategy: "CANCEL_QUEUED_EXCEPT_NEWEST"
+    }])
+    const ThrottledWorker = HatchetWorker.layerRunToCompletion({
+      name: "e2e-concurrency-worker",
+      workflows: Throttled.toLayer(({ label }) => Effect.as(Effect.sleep("2 seconds"), label))
+    }, config)
+
+    const group = `group-${Math.floor(Math.random() * 1_000_000)}`
+    const program = Effect.gen(function*() {
+      yield* Layer.build(ThrottledWorker)
+      const run = (label: string) =>
+        Throttled.execute({ group, label }).pipe(Effect.provide(ClientLive), Effect.exit, Effect.forkScoped)
+      const first = yield* run("first")
+      yield* Effect.sleep("750 millis")
+      const queued = yield* run("queued")
+      yield* Effect.sleep("750 millis")
+      const newest = yield* run("newest")
+      return yield* Effect.all([Fiber.join(first), Fiber.join(queued), Fiber.join(newest)]).pipe(
+        Effect.timeout(60_000)
+      )
+    }).pipe(Effect.scoped)
+
+    const [first, queued, newest] = await Effect.runPromise(program)
+    expect(first).toStrictEqual(Exit.succeed("first"))
+    expect(Exit.isFailure(queued) && Cause.hasInterrupts(queued.cause)).toBe(true)
+    expect(newest).toStrictEqual(Exit.succeed("newest"))
+  })
 })

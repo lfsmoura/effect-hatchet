@@ -218,3 +218,45 @@ all of them and preserves input order in `postings`; its `concurrency` option
 allows the child runs to execute in parallel.
 
 See `example/erp/ProcessInvoice.ts` for the complete parent/child workflow.
+
+## 7. Limit concurrency
+
+Annotate a workflow with `HatchetWorkflowEngine.Concurrency` to register
+Hatchet concurrency rules for its runs. Each rule groups runs by a CEL
+expression over the run input; the workflow payload is available as
+`input.payload`, in its schema-encoded form:
+
+```ts
+import * as HatchetWorkflowEngine from "../src/HatchetWorkflowEngine.ts"
+
+export const SyncCustomer = Workflow.make("SyncCustomer", {
+  payload: { customerId: Schema.String, tier: Schema.String },
+  success: Schema.Void,
+  idempotencyKey: ({ customerId }) => customerId
+}).annotate(HatchetWorkflowEngine.Concurrency, [
+  {
+    // One sync per customer; a new request replaces any queued one.
+    expression: "input.payload.customerId",
+    maxRuns: 1,
+    limitStrategy: "CANCEL_QUEUED_EXCEPT_NEWEST"
+  },
+  {
+    // One CRM-wide limit shared by every workflow using the name "crm-api".
+    expression: "'crm'",
+    maxRuns: "input.payload.tier == 'enterprise' ? 20 : 5",
+    name: "crm-api",
+    isTenantScoped: true
+  }
+])
+```
+
+| Option | Meaning |
+| --- | --- |
+| `expression` | CEL expression computing the group key. |
+| `maxRuns` | Concurrent runs per group: a number or a CEL expression. Hatchet defaults to 1. |
+| `limitStrategy` | `CANCEL_IN_PROGRESS` (Hatchet default), `CANCEL_NEWEST`, `GROUP_ROUND_ROBIN`, `CANCEL_QUEUED_EXCEPT_NEWEST` or `CANCEL_QUEUED_EXCEPT_OLDEST`. |
+| `name`, `isTenantScoped` | Share one limit across workflows declaring the same name. |
+
+Rules are registered with the workflow when the worker starts, so they apply to
+runs dispatched from any client. A run cancelled by a rule completes as
+interrupted for every caller waiting on it.

@@ -25,6 +25,10 @@ jobs:
         uses: oven-sh/setup-bun@v2
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
+      - name: Unit tests
+        run: pnpm test
+      - name: E2E tests (embedded Hatchet)
+        run: pnpm test:e2e
       - name: Require version advancement
         env:
           BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
