@@ -1,6 +1,6 @@
 /** Starts a scoped Hatchet worker after registering its workflow layers. */
 import type * as Config from "effect/Config"
-import { Duration, Effect, Layer } from "effect"
+import { Context, Deferred, Duration, Effect, Layer } from "effect"
 import { WorkflowEngine } from "effect/unstable/workflow"
 import type { HatchetConfig } from "./HatchetWorkflowEngine.ts"
 import { configFromEnv, layerInternal } from "./HatchetWorkflowEngine.ts"
@@ -18,10 +18,25 @@ export interface HatchetWorkerOptions<E = never, R = never> {
   readonly readyTimeout?: Duration.Input
 }
 
+/** The worker's long-running start operation, observed within the worker layer's scope. */
+export class WorkerLifetime extends Context.Service<WorkerLifetime, {
+  readonly awaitTermination: Effect.Effect<void, HatchetError>
+}>()("effect-hatchet/WorkerLifetime") {}
+
+/**
+ * Waits for the worker to stop, propagating an unexpected start failure.
+ * Unlike Layer.launch, this observes failures after the layer has finished building.
+ * Run it within a scope provided with a worker layer.
+ */
+export const awaitTermination: Effect.Effect<void, HatchetError, WorkerLifetime> = WorkerLifetime.pipe(
+  Effect.flatMap((worker) => worker.awaitTermination)
+)
+
 const workerLayer = (
   options: Omit<HatchetWorkerOptions<unknown, unknown>, "workflows">
-): Layer.Layer<never, HatchetError, HatchetRuntime> =>
-  Layer.effectDiscard(
+): Layer.Layer<WorkerLifetime, HatchetError, HatchetRuntime> =>
+  Layer.effect(
+    WorkerLifetime,
     Effect.gen(function*() {
       const state = yield* HatchetRuntime
       if (state.tasks.size === 0) {
@@ -32,6 +47,7 @@ const workerLayer = (
         )
       }
 
+      const termination = yield* Deferred.make<void, HatchetError>()
       const worker = yield* Effect.acquireRelease(
         Effect.tryPromise({
           try: () =>
@@ -49,18 +65,24 @@ const workerLayer = (
         catch: toHatchetError("Worker")
       }).pipe(
         Effect.tapError((error) => Effect.logError("Hatchet worker stopped unexpectedly", error)),
+        Effect.exit,
+        Effect.flatMap((exit) => Deferred.done(termination, exit)),
         Effect.forkScoped
       )
       yield* Effect.yieldNow
 
-      yield* Effect.tryPromise({
-        try: () => worker.waitUntilReady(Duration.toMillis(options.readyTimeout ?? "30 seconds")),
-        catch: toHatchetError("Worker")
-      })
+      yield* Effect.raceFirst(
+        Effect.tryPromise({
+          try: () => worker.waitUntilReady(Duration.toMillis(options.readyTimeout ?? "30 seconds")),
+          catch: toHatchetError("Worker")
+        }),
+        Deferred.await(termination).pipe(Effect.andThen(Effect.never))
+      )
 
       yield* Effect.logInfo(`HatchetWorker "${options.name}" started`).pipe(
         Effect.annotateLogs({ workflows: [...state.tasks.keys()].join(", ") })
       )
+      return { awaitTermination: Deferred.await(termination) }
     })
   )
 
@@ -68,7 +90,7 @@ const layerWithMode = <E, R>(
   activityMode: ActivityMode,
   options: HatchetWorkerOptions<E, R>,
   config: HatchetConfig
-): Layer.Layer<never, E | HatchetError, Exclude<R, WorkflowEngine.WorkflowEngine | HatchetRuntime>> =>
+): Layer.Layer<WorkerLifetime, E | HatchetError, Exclude<R, WorkflowEngine.WorkflowEngine | HatchetRuntime>> =>
   workerLayer(options).pipe(
     Layer.provide(options.workflows),
     Layer.provide(layerInternal(activityMode, config))
@@ -78,22 +100,22 @@ const layerWithMode = <E, R>(
 export const layerStrict = <E, R>(
   options: HatchetWorkerOptions<E, R>,
   config: HatchetConfig = {}
-): Layer.Layer<never, E | HatchetError, Exclude<R, WorkflowEngine.WorkflowEngine | HatchetRuntime>> =>
+): Layer.Layer<WorkerLifetime, E | HatchetError, Exclude<R, WorkflowEngine.WorkflowEngine | HatchetRuntime>> =>
   layerWithMode("strict", options, config)
 
 /** Worker for run-to-completion workflows with inline, at-least-once activities. */
 export const layerRunToCompletion = <E, R>(
   options: HatchetWorkerOptions<E, R>,
   config: HatchetConfig = {}
-): Layer.Layer<never, E | HatchetError, Exclude<R, WorkflowEngine.WorkflowEngine | HatchetRuntime>> =>
+): Layer.Layer<WorkerLifetime, E | HatchetError, Exclude<R, WorkflowEngine.WorkflowEngine | HatchetRuntime>> =>
   layerWithMode("inline-at-least-once", options, config)
 
 export const layerStrictFromConfig = <E, R>(
   options: HatchetWorkerOptions<E, R>
-): Layer.Layer<never, E | HatchetError | Config.ConfigError, Exclude<R, WorkflowEngine.WorkflowEngine | HatchetRuntime>> =>
+): Layer.Layer<WorkerLifetime, E | HatchetError | Config.ConfigError, Exclude<R, WorkflowEngine.WorkflowEngine | HatchetRuntime>> =>
   Layer.unwrap(configFromEnv.pipe(Effect.map((config) => layerStrict(options, config))))
 
 export const layerRunToCompletionFromConfig = <E, R>(
   options: HatchetWorkerOptions<E, R>
-): Layer.Layer<never, E | HatchetError | Config.ConfigError, Exclude<R, WorkflowEngine.WorkflowEngine | HatchetRuntime>> =>
+): Layer.Layer<WorkerLifetime, E | HatchetError | Config.ConfigError, Exclude<R, WorkflowEngine.WorkflowEngine | HatchetRuntime>> =>
   Layer.unwrap(configFromEnv.pipe(Effect.map((config) => layerRunToCompletion(options, config))))

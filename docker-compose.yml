@@ -19,8 +19,8 @@ services:
   hatchet-lite:
     image: ghcr.io/hatchet-dev/hatchet/hatchet-lite:latest
     ports:
-      - "8888:8888"
-      - "7077:7077"
+      - "127.0.0.1:8888:8888"
+      - "127.0.0.1:7077:7077"
     depends_on:
       postgres:
         condition: service_healthy

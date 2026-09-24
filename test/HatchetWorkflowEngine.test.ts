@@ -44,7 +44,13 @@ interface RunListOptions {
 }
 
 /** Minimal in-memory stand-in for the Hatchet server + SDK. */
-const makeFakeHatchet = (workerFailure?: Error) => {
+const makeFakeHatchet = (
+  workerFailure?: Error,
+  workerLifecycle?: {
+    readonly start?: () => Promise<void>
+    readonly waitUntilReady?: () => Promise<void>
+  }
+) => {
   const fns = new Map<string, (input: any, ctx: any) => Promise<any>>()
   const taskOptions = new Map<string, any>()
   const runs = new Map<string, FakeRun>()
@@ -84,6 +90,7 @@ const makeFakeHatchet = (workerFailure?: Error) => {
   }
 
   const client = {
+    config: { namespace: undefined },
     task: (opts: any) => {
       fns.set(opts.name, opts.fn)
       taskOptions.set(opts.name, opts)
@@ -97,9 +104,9 @@ const makeFakeHatchet = (workerFailure?: Error) => {
       return {
         start: () => {
           workerState.starts++
-          return new Promise<void>(() => {})
+          return workerLifecycle?.start?.() ?? new Promise<void>(() => {})
         },
-        waitUntilReady: async () => {},
+        waitUntilReady: workerLifecycle?.waitUntilReady ?? (async () => {}),
         stop: async () => {
           workerState.stops++
         }
@@ -286,6 +293,77 @@ describe("HatchetWorkflowEngine", () => {
     expect(error).toBeInstanceOf(HatchetError)
     if (!(error instanceof HatchetError)) throw new Error("missing worker error")
     expect(error.reason).toBe("Worker")
+  })
+
+  it("fails worker acquisition if start rejects before readiness", async () => {
+    const fake = makeFakeHatchet(undefined, {
+      start: async () => {
+        throw new Error("worker could not start")
+      },
+      waitUntilReady: () => new Promise<void>(() => {})
+    })
+    const workerLayer = HatchetWorker.layerStrict({
+      name: "test-worker",
+      workflows: ProcessLineItemLive
+    }, { client: fake.client }).pipe(Layer.provide(LedgerService.layer))
+
+    const exit = await Effect.runPromiseExit(
+      Layer.build(workerLayer).pipe(Effect.scoped, Effect.timeout("1 second"))
+    )
+    const error = Exit.isFailure(exit) ? firstError(exit.cause) : undefined
+
+    expect(error).toBeInstanceOf(HatchetError)
+    if (!(error instanceof HatchetError)) throw new Error("missing worker error")
+    expect(error.reason).toBe("Worker")
+    expect(fake.workerState.stops).toBe(1)
+  })
+
+  it("observes worker.start rejection after the layer is ready", async () => {
+    let rejectStart!: (error: Error) => void
+    const fake = makeFakeHatchet(undefined, {
+      start: () => new Promise<void>((_, reject) => { rejectStart = reject })
+    })
+    const workerLayer = HatchetWorker.layerStrict({
+      name: "test-worker",
+      workflows: ProcessLineItemLive
+    }, { client: fake.client }).pipe(Layer.provide(LedgerService.layer))
+
+    const exit = await Effect.runPromiseExit(
+      Effect.gen(function*() {
+        const worker = yield* Layer.build(workerLayer)
+        yield* Effect.sync(() => rejectStart(new Error("worker connection lost")))
+        yield* HatchetWorker.awaitTermination.pipe(Effect.provide(worker))
+      }).pipe(Effect.scoped, Effect.timeout("1 second"))
+    )
+    const error = Exit.isFailure(exit) ? firstError(exit.cause) : undefined
+
+    expect(error).toBeInstanceOf(HatchetError)
+    if (!(error instanceof HatchetError)) throw new Error("missing worker error")
+    expect(error.reason).toBe("Worker")
+    expect(fake.workerState.starts).toBe(1)
+    expect(fake.workerState.stops).toBe(1)
+  })
+
+  it("finishes the supervised lifecycle when worker.start ends normally", async () => {
+    let finishStart!: () => void
+    const fake = makeFakeHatchet(undefined, {
+      start: () => new Promise<void>((resolve) => { finishStart = resolve })
+    })
+    const workerLayer = HatchetWorker.layerStrict({
+      name: "test-worker",
+      workflows: ProcessLineItemLive
+    }, { client: fake.client }).pipe(Layer.provide(LedgerService.layer))
+
+    await Effect.runPromise(
+      Effect.gen(function*() {
+        const worker = yield* Layer.build(workerLayer)
+        yield* Effect.sync(() => finishStart())
+        yield* HatchetWorker.awaitTermination.pipe(Effect.provide(worker))
+      }).pipe(Effect.scoped, Effect.timeout("1 second"))
+    )
+
+    expect(fake.workerState.starts).toBe(1)
+    expect(fake.workerState.stops).toBe(1)
   })
 
   it("starts and stops the worker within the layer scope", async () => {

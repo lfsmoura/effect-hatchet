@@ -12,7 +12,8 @@
  * re-enters the Effect runtime and executes the workflow with its
  * Layer-provided InvoiceService; the typed result travels back.
  */
-import { Cause, Effect, Exit, Fiber, Layer, Redacted, Result, Schema } from "effect"
+import { HatchetClient } from "@hatchet-dev/typescript-sdk/v1/index.js"
+import { Cause, Effect, Exit, Fiber, Layer, Option, Redacted, Result, Schema } from "effect"
 import { Workflow } from "effect/unstable/workflow"
 import { describe, expect, inject, it } from "vitest"
 import * as HatchetWorker from "../src/HatchetWorker.ts"
@@ -140,4 +141,85 @@ describe("HatchetWorkflowEngine e2e", () => {
     expect(Exit.isFailure(queued) && Cause.hasInterrupts(queued.cause)).toBe(true)
     expect(newest).toStrictEqual(Exit.succeed("newest"))
   })
+
+  it("recovers namespaced runs across clients for poll and interrupt", async () => {
+    const namespace = "effect_e2e_"
+    const makeNamespacedConfig = (): HatchetWorkflowEngine.HatchetConfig => ({
+      ...config,
+      client: HatchetClient.init({
+        token: hatchet.token,
+        ...(hatchet.hostPort !== undefined ? { host_port: hatchet.hostPort } : {}),
+        tls_config: { tls_strategy: "none" },
+        namespace
+      })
+    })
+    const Completed = Workflow.make("NamespacedMixedCase", {
+      payload: { value: Schema.String },
+      success: Schema.String,
+      idempotencyKey: ({ value }) => value
+    })
+    // An already-prefixed name must not acquire the namespace twice.
+    const Interrupted = Workflow.make(`${namespace}AlreadyPrefixed`, {
+      payload: { value: Schema.String },
+      success: Schema.String,
+      idempotencyKey: ({ value }) => value
+    })
+    const Worker = HatchetWorker.layerRunToCompletion({
+      name: "e2e-namespaced-worker",
+      workflows: Layer.mergeAll(
+        Completed.toLayer(({ value }) => Effect.succeed(value)),
+        Interrupted.toLayer(({ value }) => Effect.as(Effect.sleep("10 seconds"), value))
+      )
+    }, makeNamespacedConfig())
+    const Dispatch = HatchetWorkflowEngine.layerRunToCompletion(makeNamespacedConfig())
+    const Poll = HatchetWorkflowEngine.layerRunToCompletion(makeNamespacedConfig())
+    const Interrupt = HatchetWorkflowEngine.layerRunToCompletion(makeNamespacedConfig())
+    const probe = makeNamespacedConfig().client!
+    const value = `namespace-${crypto.randomUUID()}`
+
+    const program = Effect.gen(function*() {
+      yield* Layer.build(Worker)
+      const completedId = yield* Completed.execute({ value }, { discard: true }).pipe(Effect.provide(Dispatch))
+      const completed = yield* Effect.gen(function*() {
+        while (true) {
+          const result = yield* Completed.poll(completedId)
+          if (Option.isSome(result)) return result.value
+          yield* Effect.sleep("100 millis")
+        }
+      }).pipe(Effect.provide(Poll))
+
+      const interruptedId = yield* Interrupted.execute({ value }, { discard: true }).pipe(
+        Effect.provide(Dispatch)
+      )
+      // Dispatch may return before Hatchet's list index contains the run.
+      // Observe persistence without populating the interrupting engine's cache.
+      while (true) {
+        const rows = yield* Effect.promise(() =>
+          probe.runs.list({
+            additionalMetadata: { executionId: interruptedId },
+            since: new Date(Date.now() - 60_000)
+          })
+        )
+        if (rows.rows.length > 0) break
+        yield* Effect.sleep("100 millis")
+      }
+      const interrupted = yield* Effect.gen(function*() {
+        yield* Interrupted.interrupt(interruptedId)
+        while (true) {
+          const result = yield* Interrupted.poll(interruptedId)
+          if (Option.isSome(result)) return result.value
+          yield* Effect.sleep("100 millis")
+        }
+      }).pipe(Effect.provide(Interrupt))
+      return { completed, interrupted }
+    }).pipe(Effect.scoped, Effect.timeout(60_000))
+
+    const { completed, interrupted } = await Effect.runPromise(program)
+    expect(completed._tag).toBe("Complete")
+    if (completed._tag === "Complete") expect(completed.exit).toStrictEqual(Exit.succeed(value))
+    expect(interrupted._tag).toBe("Complete")
+    if (interrupted._tag === "Complete") {
+      expect(Exit.isFailure(interrupted.exit) && Cause.hasInterrupts(interrupted.exit.cause)).toBe(true)
+    }
+  }, 120_000)
 })

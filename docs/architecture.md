@@ -44,6 +44,11 @@ Worker layers use the corresponding `HatchetWorker` constructor and take a
 `workflows` Layer, so registration ordering is part of the API rather than a
 composition convention.
 
+Worker process entry points provide their worker layer to
+`HatchetWorker.awaitTermination` inside `Effect.scoped`. This observes
+post-start worker failures; `Layer.launch` alone cannot propagate errors
+from a previously built layer's background fibers.
+
 ## Durability limit
 
 Hatchet persists task runs, but the Effect workflow contract also expects

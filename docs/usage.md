@@ -64,7 +64,7 @@ invoice, or job ID.
 Create `example/TutorialWorker.ts`:
 
 ```ts
-import { Effect, Layer } from "effect"
+import { Effect } from "effect"
 import * as HatchetWorker from "../src/HatchetWorker.ts"
 import { GreetLive } from "./GreetWorkflow.ts"
 
@@ -73,7 +73,9 @@ const WorkerLive = HatchetWorker.layerStrictFromConfig({
   workflows: GreetLive
 })
 
-Effect.runPromise(Layer.launch(WorkerLive)).catch((error) => {
+Effect.runPromise(
+  HatchetWorker.awaitTermination.pipe(Effect.provide(WorkerLive), Effect.scoped)
+).catch((error) => {
   console.error(error)
   process.exit(1)
 })
@@ -81,7 +83,8 @@ Effect.runPromise(Layer.launch(WorkerLive)).catch((error) => {
 
 `layerStrictFromConfig` loads the Hatchet token and connection settings through
 Effect `Config`, registers `GreetLive`, and starts the worker in the same scoped
-Layer. Keep the worker process running while clients dispatch workflows.
+Layer. `awaitTermination` keeps the process running and fails if the worker
+stops with an error after startup; the scope stops the worker on shutdown.
 
 ## 4. Create the client
 

@@ -47,6 +47,10 @@ pnpm main
 
 The local Hatchet dashboard is available at <http://localhost:8888>.
 
+Compose publishes the dashboard and gRPC ports on `127.0.0.1` only. The demo
+credentials and plaintext transport are not suitable for a network-accessible
+instance; the token helper restricts `.hatchet-token` to the current user.
+
 ## Verify changes
 
 ```sh

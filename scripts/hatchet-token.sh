@@ -15,6 +15,9 @@ if [ -z "$TOKEN" ]; then
   exit 1
 fi
 
+umask 077
+touch .hatchet-token
+chmod 600 .hatchet-token
 printf '%s' "$TOKEN" > .hatchet-token
 echo "Token written to .hatchet-token"
 echo "Export it with: export HATCHET_CLIENT_TOKEN=\$(cat .hatchet-token) HATCHET_CLIENT_TLS_STRATEGY=none"

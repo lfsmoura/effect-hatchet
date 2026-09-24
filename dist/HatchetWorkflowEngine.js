@@ -141,9 +141,11 @@ var make = Effect2.gen(function* () {
     const cached = state.runIds.get(executionId);
     if (cached !== undefined)
       return Option.some(cached);
+    const namespace = client.config.namespace;
+    const workflowName = namespace ? (workflow._tag.startsWith(namespace) ? workflow._tag : `${namespace}${workflow._tag}`).toLowerCase() : workflow._tag;
     const runs = yield* Effect2.tryPromise({
       try: () => client.runs.list({
-        workflowNames: [workflow._tag],
+        workflowNames: [workflowName],
         additionalMetadata: { executionId },
         since: new Date(Date.now() - config.idempotencyFallbackTtlMs)
       }),

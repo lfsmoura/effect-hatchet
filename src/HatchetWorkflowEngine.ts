@@ -173,10 +173,16 @@ const make: Effect.Effect<WorkflowEngine.WorkflowEngine["Service"], never, Hatch
       Effect.gen(function*() {
         const cached = state.runIds.get(executionId)
         if (cached !== undefined) return Option.some(cached)
+        // Dispatch and worker registration normalize names with the client
+        // namespace, but runs.list resolves workflowNames literally.
+        const namespace = client.config.namespace
+        const workflowName = namespace
+          ? (workflow._tag.startsWith(namespace) ? workflow._tag : `${namespace}${workflow._tag}`).toLowerCase()
+          : workflow._tag
         const runs = yield* Effect.tryPromise({
           try: () =>
             client.runs.list({
-              workflowNames: [workflow._tag],
+              workflowNames: [workflowName],
               additionalMetadata: { executionId },
               since: new Date(Date.now() - config.idempotencyFallbackTtlMs)
             }),

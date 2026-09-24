@@ -110,13 +110,19 @@ const MainLive = HatchetWorker.layerRunToCompletionFromConfig({
 }).pipe(
   Layer.provide(Layer.mergeAll(InvoiceService.layer, LedgerService.layer))
 )
-Effect.runPromise(Layer.launch(MainLive))
+Effect.runPromise(
+  HatchetWorker.awaitTermination.pipe(Effect.provide(MainLive), Effect.scoped)
+)
 ```
 
 Use `layerStrictFromConfig` for workflows that do not call `Activity.make`; it
 rejects activities and durable-suspension features explicitly. Swapping the
 Hatchet engine for `WorkflowEngine.layerMemory` or `ClusterWorkflowEngine.layer`
 still requires no workflow or business-code changes.
+
+Worker process bootstraps await `HatchetWorker.awaitTermination` within the
+worker layer's scope. Unlike `Layer.launch`, this surfaces a worker connection
+failure after startup instead of leaving an idle process running.
 
 ## Running it
 
@@ -131,6 +137,11 @@ pnpm main                     # terminal 2: dispatch ProcessInvoice({ invoiceId:
 ```
 
 Dashboard: http://localhost:8888 (admin@example.com / Admin123!!).
+
+The bundled dashboard credentials and plaintext transport are for local use
+only. Compose binds both published Hatchet ports to `127.0.0.1`; the token
+helper writes `.hatchet-token` with owner-only permissions. Do not expose this
+demo instance to a network.
 
 ## Tests
 
@@ -177,7 +188,10 @@ test/
 Every pull request to `main` must advance the semantic version in `package.json`
 and commit the output of `bun run build`. After the pull request is merged,
 GitHub Actions creates a `v<version>` release containing the built `dist/`
-directory and `package.json`.
+directory, `package.json`, and [MIT license](./LICENSE).
+
+After a force-push that rewrites history, version validation compares against
+the last reachable release tag if the previous commit is no longer available.
 
 ## Findings
 

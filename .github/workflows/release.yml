@@ -32,6 +32,7 @@ jobs:
       - name: Require version advancement
         env:
           BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+          FORCE_PUSH: ${{ github.event_name == 'push' && github.event.forced }}
         run: bun scripts/check-version.ts "$BASE_SHA"
       - name: Build dist
         run: bun run build
@@ -57,7 +58,7 @@ jobs:
         run: |
           version=$(node -p "require('./package.json').version")
           archive="effect-hatchet-v${version}.tar.gz"
-          tar -czf "$archive" dist package.json
+          tar -czf "$archive" dist package.json LICENSE
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "archive=$archive" >> "$GITHUB_OUTPUT"
       - name: Create GitHub release

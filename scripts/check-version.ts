@@ -15,10 +15,21 @@ const readVersion = (value: unknown): string => {
 const currentPackage: unknown = await Bun.file("package.json").json()
 const currentVersion = readVersion(currentPackage)
 
-
-const previousPackage = Bun.spawnSync(["git", "show", `${baseSha}:package.json`])
+let previousRef = baseSha
+let previousPackage = Bun.spawnSync(["git", "show", `${previousRef}:package.json`])
+if (previousPackage.exitCode !== 0 && process.env.FORCE_PUSH === "true") {
+  // A force-push can make github.event.before unreachable in a fresh checkout.
+  const baseExists = Bun.spawnSync(["git", "cat-file", "-e", `${baseSha}^{commit}`])
+  if (baseExists.exitCode !== 0) {
+    const releaseTag = Bun.spawnSync(["git", "describe", "--tags", "--abbrev=0", "--match", "v[0-9]*", "HEAD^"])
+    if (releaseTag.exitCode === 0) {
+      previousRef = releaseTag.stdout.toString().trim()
+      previousPackage = Bun.spawnSync(["git", "show", `${previousRef}:package.json`])
+    }
+  }
+}
 if (previousPackage.exitCode !== 0) {
-  throw new Error(previousPackage.stderr.toString().trim() || `Cannot read package.json at ${baseSha}`)
+  throw new Error(previousPackage.stderr.toString().trim() || `Cannot read package.json at ${previousRef}`)
 }
 
 const previousPackageJson: unknown = JSON.parse(previousPackage.stdout.toString())

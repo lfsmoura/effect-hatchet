@@ -20,7 +20,9 @@ const MainLive = HatchetWorker.layerRunToCompletionFromConfig({
   Layer.provide(Layer.mergeAll(InvoiceService.layer, LedgerService.layer))
 )
 
-Effect.runPromise(Layer.launch(MainLive)).catch((error) => {
+Effect.runPromise(
+  HatchetWorker.awaitTermination.pipe(Effect.provide(MainLive), Effect.scoped)
+).catch((error) => {
   console.error(error)
   process.exit(1)
 })
