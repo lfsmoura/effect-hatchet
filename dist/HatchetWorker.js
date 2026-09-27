@@ -1,6 +1,6 @@
 // @bun
 // src/HatchetWorker.ts
-import { Context as Context3, Deferred, Duration as Duration2, Effect as Effect3, Layer as Layer2 } from "effect";
+import { Context as Context3, Deferred, Duration as Duration3, Effect as Effect4, Layer as Layer2 } from "effect";
 
 // src/HatchetWorkflowEngine.ts
 import {
@@ -296,40 +296,81 @@ var layerRunToCompletion = (config = {}) => publicLayer("inline-at-least-once", 
 var layerStrictFromConfig = Layer.unwrap(configFromEnv.pipe(Effect2.map(layerStrict)));
 var layerRunToCompletionFromConfig = Layer.unwrap(configFromEnv.pipe(Effect2.map(layerRunToCompletion)));
 
+// src/internal/sdkWorkarounds.ts
+import { HATCHET_VERSION } from "@hatchet-dev/typescript-sdk/version.js";
+import { Duration as Duration2, Effect as Effect3 } from "effect";
+var testedSdkVersion = "1.33.2";
+var sdkVersionChecked = false;
+var warnIfUntestedSdkVersion = (installed = HATCHET_VERSION) => Effect3.suspend(() => {
+  if (sdkVersionChecked || installed === testedSdkVersion)
+    return Effect3.void;
+  sdkVersionChecked = true;
+  return Effect3.logWarning(`effect-hatchet was tested with @hatchet-dev/typescript-sdk ${testedSdkVersion}, ` + `but ${installed} is installed; worker shutdown behavior can be different`);
+});
+var createWorker = (client, name, options) => client.worker(name, { ...options, handleKill: false });
+var stop = (worker, startSettled, readyTimeout) => Effect3.raceFirst(Effect3.promise(() => startSettled), waitUntilReady(worker, readyTimeout).pipe(Effect3.catch(() => Effect3.logWarning(`Hatchet worker did not become ready within ${Duration2.format(readyTimeout)} during shutdown; ` + "stopping it anyway. It can still connect and get tasks, so stop the process after the program returns.")))).pipe(Effect3.andThen(Effect3.promise(() => worker.stop())), Effect3.ignore);
+var readyPollSlice = 250;
+var waitUntilReady = (worker, timeout) => Effect3.gen(function* () {
+  const deadline = Date.now() + Duration2.toMillis(timeout);
+  while (true) {
+    const ready = yield* Effect3.promise(() => worker.waitUntilReady(readyPollSlice).then(() => true, () => false));
+    if (ready)
+      return;
+    if (Date.now() >= deadline) {
+      return yield* Effect3.fail(new Error(`Worker ${worker.name} did not become ready within ${Duration2.format(timeout)}`));
+    }
+  }
+});
+
 // src/HatchetWorker.ts
 class WorkerLifetime extends Context3.Service()("effect-hatchet/WorkerLifetime") {
 }
-var awaitTermination = WorkerLifetime.pipe(Effect3.flatMap((worker) => worker.awaitTermination));
-var workerLayer = (options) => Layer2.effect(WorkerLifetime, Effect3.gen(function* () {
+var awaitTermination = WorkerLifetime.pipe(Effect4.flatMap((worker) => worker.awaitTermination));
+var workerLayer = (options) => Layer2.effect(WorkerLifetime, Effect4.gen(function* () {
   const state = yield* HatchetRuntime;
   if (state.tasks.size === 0) {
-    return yield* Effect3.die(new Error("HatchetWorker built with no registered workflows; pass Workflow.toLayer layers in the workflows option"));
+    return yield* Effect4.die(new Error("HatchetWorker built with no registered workflows; pass Workflow.toLayer layers in the workflows option"));
   }
+  yield* warnIfUntestedSdkVersion();
+  const readyTimeout = Duration3.fromInputUnsafe(options.readyTimeout ?? "30 seconds");
   const termination = yield* Deferred.make();
-  const worker = yield* Effect3.acquireRelease(Effect3.tryPromise({
-    try: () => state.client.worker(options.name, {
+  yield* Effect4.acquireRelease(Effect4.sync(() => {
+    const onSignal = () => {
+      Deferred.doneUnsafe(termination, Effect4.void);
+    };
+    process.on("SIGTERM", onSignal);
+    process.on("SIGINT", onSignal);
+    return onSignal;
+  }), (onSignal) => Effect4.sync(() => {
+    process.removeListener("SIGTERM", onSignal);
+    process.removeListener("SIGINT", onSignal);
+  }));
+  let startSettled = Promise.resolve();
+  const worker = yield* Effect4.acquireRelease(Effect4.tryPromise({
+    try: () => createWorker(state.client, options.name, {
       workflows: [...state.tasks.values()],
       slots: options.slots ?? 100
     }),
     catch: toHatchetError("Worker")
-  }), (worker) => Effect3.promise(() => worker.stop()).pipe(Effect3.ignore));
-  yield* Effect3.tryPromise({
-    try: () => worker.start(),
-    catch: toHatchetError("Worker")
-  }).pipe(Effect3.tapError((error) => Effect3.logError("Hatchet worker stopped unexpectedly", error)), Effect3.exit, Effect3.flatMap((exit) => Deferred.done(termination, exit)), Effect3.forkScoped);
-  yield* Effect3.yieldNow;
-  yield* Effect3.raceFirst(Effect3.tryPromise({
-    try: () => worker.waitUntilReady(Duration2.toMillis(options.readyTimeout ?? "30 seconds")),
-    catch: toHatchetError("Worker")
-  }), Deferred.await(termination).pipe(Effect3.andThen(Effect3.never)));
-  yield* Effect3.logInfo(`HatchetWorker "${options.name}" started`).pipe(Effect3.annotateLogs({ workflows: [...state.tasks.keys()].join(", ") }));
+  }), (worker) => stop(worker, startSettled, readyTimeout));
+  const started = worker.start();
+  startSettled = started.then(() => {
+    return;
+  }, () => {
+    return;
+  });
+  yield* Effect4.tryPromise({ try: () => started, catch: toHatchetError("Worker") }).pipe(Effect4.andThen(Effect4.fail(new HatchetError({ reason: "Worker", message: "Hatchet worker stopped without a shutdown request" }))), Effect4.tapError((error) => Effect4.logError("Hatchet worker stopped unexpectedly", error)), Effect4.exit, Effect4.flatMap((exit) => Deferred.done(termination, exit)), Effect4.forkScoped);
+  const ready = yield* Effect4.raceFirst(waitUntilReady(worker, readyTimeout).pipe(Effect4.mapError(toHatchetError("Worker")), Effect4.as(true)), Deferred.await(termination).pipe(Effect4.as(false)));
+  if (ready) {
+    yield* Effect4.logInfo(`HatchetWorker "${options.name}" started`).pipe(Effect4.annotateLogs({ workflows: [...state.tasks.keys()].join(", ") }));
+  }
   return { awaitTermination: Deferred.await(termination) };
 }));
 var layerWithMode = (activityMode, options, config) => workerLayer(options).pipe(Layer2.provide(options.workflows), Layer2.provide(layerInternal(activityMode, config)));
 var layerStrict2 = (options, config = {}) => layerWithMode("strict", options, config);
 var layerRunToCompletion2 = (options, config = {}) => layerWithMode("inline-at-least-once", options, config);
-var layerStrictFromConfig2 = (options) => Layer2.unwrap(configFromEnv.pipe(Effect3.map((config) => layerStrict2(options, config))));
-var layerRunToCompletionFromConfig2 = (options) => Layer2.unwrap(configFromEnv.pipe(Effect3.map((config) => layerRunToCompletion2(options, config))));
+var layerStrictFromConfig2 = (options) => Layer2.unwrap(configFromEnv.pipe(Effect4.map((config) => layerStrict2(options, config))));
+var layerRunToCompletionFromConfig2 = (options) => Layer2.unwrap(configFromEnv.pipe(Effect4.map((config) => layerRunToCompletion2(options, config))));
 export {
   WorkerLifetime,
   awaitTermination,

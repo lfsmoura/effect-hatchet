@@ -8,7 +8,7 @@
  *   Layer-provided InvoiceService → encoded result → decoded typed result.
  */
 import { ConcurrencyLimitStrategy } from "@hatchet-dev/typescript-sdk/v1/index.js"
-import { Cause, ConfigProvider, Duration, Effect, Exit, Layer, Redacted, Result, Schema } from "effect"
+import { Cause, ConfigProvider, Duration, Effect, Exit, Layer, Logger, Redacted, Result, Schema } from "effect"
 
 const firstError = (cause: Cause.Cause<unknown>): unknown => {
   const found = Cause.findError(cause)
@@ -23,6 +23,7 @@ import { ProcessLineItemLive } from "../example/erp/ProcessLineItem.ts"
 import * as HatchetWorkflowEngine from "../src/HatchetWorkflowEngine.ts"
 import * as HatchetWorker from "../src/HatchetWorker.ts"
 import { HatchetError, UnsupportedWorkflowCapability } from "../src/internal/errors.ts"
+import * as SdkWorkarounds from "../src/internal/sdkWorkarounds.ts"
 
 interface FakeRun {
   status: "RUNNING" | "COMPLETED" | "FAILED" | "CANCELLED"
@@ -344,7 +345,7 @@ describe("HatchetWorkflowEngine", () => {
     expect(fake.workerState.stops).toBe(1)
   })
 
-  it("finishes the supervised lifecycle when worker.start ends normally", async () => {
+  it("fails awaitTermination when worker.start ends without a shutdown request", async () => {
     let finishStart!: () => void
     const fake = makeFakeHatchet(undefined, {
       start: () => new Promise<void>((resolve) => { finishStart = resolve })
@@ -354,15 +355,42 @@ describe("HatchetWorkflowEngine", () => {
       workflows: ProcessLineItemLive
     }, { client: fake.client }).pipe(Layer.provide(LedgerService.layer))
 
-    await Effect.runPromise(
+    const exit = await Effect.runPromiseExit(
       Effect.gen(function*() {
         const worker = yield* Layer.build(workerLayer)
         yield* Effect.sync(() => finishStart())
         yield* HatchetWorker.awaitTermination.pipe(Effect.provide(worker))
       }).pipe(Effect.scoped, Effect.timeout("1 second"))
     )
+    const error = Exit.isFailure(exit) ? firstError(exit.cause) : undefined
 
+    expect(error).toBeInstanceOf(HatchetError)
+    if (!(error instanceof HatchetError)) throw new Error("missing worker error")
+    expect(error.reason).toBe("Worker")
     expect(fake.workerState.starts).toBe(1)
+    expect(fake.workerState.stops).toBe(1)
+  })
+
+  it("fails the layer without the ready timeout when worker.start ends before readiness", async () => {
+    // The SDK resolves start() when the health server cannot listen.
+    const fake = makeFakeHatchet(undefined, {
+      start: async () => {},
+      waitUntilReady: () => new Promise<void>(() => {})
+    })
+    const workerLayer = HatchetWorker.layerStrict({
+      name: "test-worker",
+      workflows: ProcessLineItemLive,
+      readyTimeout: "30 seconds"
+    }, { client: fake.client }).pipe(Layer.provide(LedgerService.layer))
+
+    const exit = await Effect.runPromiseExit(
+      Layer.build(workerLayer).pipe(Effect.scoped, Effect.timeout("1 second"))
+    )
+    const error = Exit.isFailure(exit) ? firstError(exit.cause) : undefined
+
+    expect(error).toBeInstanceOf(HatchetError)
+    if (!(error instanceof HatchetError)) throw new Error("missing worker error")
+    expect(error.reason).toBe("Worker")
     expect(fake.workerState.stops).toBe(1)
   })
 
@@ -448,5 +476,24 @@ describe("HatchetWorkflowEngine", () => {
     ])
     // Workflows without the annotation register no concurrency at all.
     expect(fake.taskOptions.get("ProcessLineItem")).not.toHaveProperty("concurrency")
+  })
+
+  it("warns one time when the installed SDK version is not the tested version", async () => {
+    const warnings: Array<string> = []
+    const collector = Logger.make((options) => {
+      if (options.logLevel === "Warn") warnings.push(String(options.message))
+    })
+    const check = (installed: string) =>
+      Effect.runPromise(SdkWorkarounds.warnIfUntestedSdkVersion(installed).pipe(
+        Effect.provide(Logger.layer([collector]))
+      ))
+
+    await check(SdkWorkarounds.testedSdkVersion)
+    expect(warnings).toHaveLength(0)
+    await check("1.33.3")
+    await check("1.34.0")
+    expect(warnings).toHaveLength(1)
+    expect(warnings[0]).toContain(SdkWorkarounds.testedSdkVersion)
+    expect(warnings[0]).toContain("1.33.3")
   })
 })

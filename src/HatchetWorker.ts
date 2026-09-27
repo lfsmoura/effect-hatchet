@@ -7,6 +7,7 @@ import { configFromEnv, layerInternal } from "./HatchetWorkflowEngine.ts"
 import { HatchetError, toHatchetError } from "./internal/errors.ts"
 import type { ActivityMode } from "./internal/HatchetRuntime.ts"
 import { HatchetRuntime } from "./internal/HatchetRuntime.ts"
+import * as SdkWorkarounds from "./internal/sdkWorkarounds.ts"
 
 export interface HatchetWorkerOptions<E = never, R = never> {
   readonly name: string
@@ -14,7 +15,11 @@ export interface HatchetWorkerOptions<E = never, R = never> {
   readonly workflows: Layer.Layer<never, E, R>
   /** Maximum concurrent workflow runs. Defaults to 100. */
   readonly slots?: number
-  /** How long to wait for the worker to connect and register. Defaults to 30 seconds. */
+  /**
+   * How long to wait for the worker to connect and register. Also limits how long a
+   * shutdown during startup waits for the connection before it stops the worker.
+   * Defaults to 30 seconds.
+   */
   readonly readyTimeout?: Duration.Input
 }
 
@@ -24,7 +29,13 @@ export class WorkerLifetime extends Context.Service<WorkerLifetime, {
 }>()("effect-hatchet/WorkerLifetime") {}
 
 /**
- * Waits for the worker to stop, propagating an unexpected start failure.
+ * Waits for a shutdown request (SIGTERM or SIGINT) or an unexpected worker stop.
+ *
+ * - Success: a shutdown was requested. The worker drains when the scope closes,
+ *   and the scoped program returns after the running tasks complete.
+ * - `HatchetError` with reason `"Worker"`: the worker start failed, or the worker
+ *   stopped without a shutdown request.
+ *
  * Unlike Layer.launch, this observes failures after the layer has finished building.
  * Run it within a scope provided with a worker layer.
  */
@@ -47,41 +58,73 @@ const workerLayer = (
         )
       }
 
+      yield* SdkWorkarounds.warnIfUntestedSdkVersion()
+      const readyTimeout = Duration.fromInputUnsafe(options.readyTimeout ?? "30 seconds")
+
+      // Success: a shutdown was requested. Failure: the worker stopped without one.
       const termination = yield* Deferred.make<void, HatchetError>()
+
+      // Installed before the SDK worker, so this listener runs before the SDK's own
+      // handler and records the shutdown request before start() settles.
+      // It does not stop the worker: the scope finalizer below drains it.
+      yield* Effect.acquireRelease(
+        Effect.sync(() => {
+          const onSignal = () => {
+            Deferred.doneUnsafe(termination, Effect.void)
+          }
+          process.on("SIGTERM", onSignal)
+          process.on("SIGINT", onSignal)
+          return onSignal
+        }),
+        (onSignal) =>
+          Effect.sync(() => {
+            process.removeListener("SIGTERM", onSignal)
+            process.removeListener("SIGINT", onSignal)
+          })
+      )
+
+      let startSettled: Promise<unknown> = Promise.resolve()
       const worker = yield* Effect.acquireRelease(
         Effect.tryPromise({
           try: () =>
-            state.client.worker(options.name, {
+            SdkWorkarounds.createWorker(state.client, options.name, {
               workflows: [...state.tasks.values()],
               slots: options.slots ?? 100
             }),
           catch: toHatchetError("Worker")
         }),
-        (worker) => Effect.promise(() => worker.stop()).pipe(Effect.ignore)
+        // The only place that stops the worker; the program returns after the drain.
+        (worker) => SdkWorkarounds.stop(worker, startSettled, readyTimeout)
       )
 
-      yield* Effect.tryPromise({
-        try: () => worker.start(),
-        catch: toHatchetError("Worker")
-      }).pipe(
+      const started = worker.start()
+      startSettled = started.then(() => undefined, () => undefined)
+      yield* Effect.tryPromise({ try: () => started, catch: toHatchetError("Worker") }).pipe(
+        Effect.andThen(Effect.fail(
+          new HatchetError({ reason: "Worker", message: "Hatchet worker stopped without a shutdown request" })
+        )),
         Effect.tapError((error) => Effect.logError("Hatchet worker stopped unexpectedly", error)),
         Effect.exit,
+        // No effect when a shutdown request completed the Deferred first.
         Effect.flatMap((exit) => Deferred.done(termination, exit)),
         Effect.forkScoped
       )
-      yield* Effect.yieldNow
 
-      yield* Effect.raceFirst(
-        Effect.tryPromise({
-          try: () => worker.waitUntilReady(Duration.toMillis(options.readyTimeout ?? "30 seconds")),
-          catch: toHatchetError("Worker")
-        }),
-        Deferred.await(termination).pipe(Effect.andThen(Effect.never))
+      // Termination ends the readiness wait immediately: a shutdown request builds
+      // the layer, and an unexpected stop fails it without waiting for the timeout.
+      const ready = yield* Effect.raceFirst(
+        SdkWorkarounds.waitUntilReady(worker, readyTimeout).pipe(
+          Effect.mapError(toHatchetError("Worker")),
+          Effect.as(true)
+        ),
+        Deferred.await(termination).pipe(Effect.as(false))
       )
 
-      yield* Effect.logInfo(`HatchetWorker "${options.name}" started`).pipe(
-        Effect.annotateLogs({ workflows: [...state.tasks.keys()].join(", ") })
-      )
+      if (ready) {
+        yield* Effect.logInfo(`HatchetWorker "${options.name}" started`).pipe(
+          Effect.annotateLogs({ workflows: [...state.tasks.keys()].join(", ") })
+        )
+      }
       return { awaitTermination: Deferred.await(termination) }
     })
   )

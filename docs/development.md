@@ -70,13 +70,25 @@ that engine, such as the docker-compose hatchet-lite above. Otherwise
 The engine binary is downloaded and cached under `~/.hatchet/embedded` on first
 use, so the suite needs neither Docker nor a token. CI runs it this way.
 
+## Upgrade the Hatchet SDK
+
+`src/internal/sdkWorkarounds.ts` contains the workarounds for the worker
+behavior of `@hatchet-dev/typescript-sdk` 1.33.2 (`testedSdkVersion`). A worker
+layer writes a warning to the log when the installed SDK version is different.
+To upgrade the SDK:
+
+1. Run `pnpm test:e2e` with the new version. `test/e2e.sdk-canary.test.ts`
+   asserts the SDK behaviors that the workarounds use.
+2. When a canary test fails, remove the related workaround.
+3. Change `testedSdkVersion` to the new version.
+
 ## Project layout
 
 ```text
 src/
   HatchetWorkflowEngine.ts  WorkflowEngine implementation
   HatchetWorker.ts          scoped Hatchet worker Layer
-  internal/                 codecs and infrastructure errors
+  internal/                 codecs, infrastructure errors and SDK workarounds
 example/
   erp/                      backend-agnostic Effect workflows and services
   Main.ts                   client bootstrap
@@ -84,5 +96,8 @@ example/
 test/
   HatchetWorkflowEngine.test.ts
   e2e.test.ts
+  e2e.shutdown.test.ts      signal and startup-failure tests in a child process
+  e2e.sdk-canary.test.ts    raw SDK behaviors that src/internal/sdkWorkarounds.ts uses
   e2e.setup.ts              embedded engine for the e2e suite
+  fixtures/                 worker process for the shutdown tests
 ```

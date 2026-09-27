@@ -11,7 +11,11 @@ export interface HatchetWorkerOptions<E = never, R = never> {
     readonly workflows: Layer.Layer<never, E, R>;
     /** Maximum concurrent workflow runs. Defaults to 100. */
     readonly slots?: number;
-    /** How long to wait for the worker to connect and register. Defaults to 30 seconds. */
+    /**
+     * How long to wait for the worker to connect and register. Also limits how long a
+     * shutdown during startup waits for the connection before it stops the worker.
+     * Defaults to 30 seconds.
+     */
     readonly readyTimeout?: Duration.Input;
 }
 declare const WorkerLifetime_base: Context.ServiceClass<WorkerLifetime, "effect-hatchet/WorkerLifetime", {
@@ -21,7 +25,13 @@ declare const WorkerLifetime_base: Context.ServiceClass<WorkerLifetime, "effect-
 export declare class WorkerLifetime extends WorkerLifetime_base {
 }
 /**
- * Waits for the worker to stop, propagating an unexpected start failure.
+ * Waits for a shutdown request (SIGTERM or SIGINT) or an unexpected worker stop.
+ *
+ * - Success: a shutdown was requested. The worker drains when the scope closes,
+ *   and the scoped program returns after the running tasks complete.
+ * - `HatchetError` with reason `"Worker"`: the worker start failed, or the worker
+ *   stopped without a shutdown request.
+ *
  * Unlike Layer.launch, this observes failures after the layer has finished building.
  * Run it within a scope provided with a worker layer.
  */
