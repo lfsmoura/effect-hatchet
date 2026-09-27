@@ -122,7 +122,10 @@ still requires no workflow or business-code changes.
 
 Worker process bootstraps await `HatchetWorker.awaitTermination` within the
 worker layer's scope. Unlike `Layer.launch`, this surfaces a worker connection
-failure after startup instead of leaving an idle process running.
+failure after startup instead of leaving an idle process running. On SIGTERM or
+SIGINT, `awaitTermination` succeeds and the worker drains when the scope closes,
+so running tasks complete and Effect finalizers run before the program returns.
+See [the shutdown limitations](docs/usage.md#shutdown-known-limitations).
 
 ## Running it
 
@@ -158,7 +161,9 @@ The e2e suite proves: real dispatch → Hatchet server → worker → Effect run
 Layer-provided services → typed result/error back to the caller; the parent run
 fans out three real `ProcessLineItem` child runs and joins them; concurrent
 duplicate executions (parents *and* children) join a single run each; a
-`Concurrency` annotation cancels queued runs except the newest.
+`Concurrency` annotation cancels queued runs except the newest; on SIGTERM a
+worker process drains its running task, runs its Effect finalizers and exits
+with code 0.
 
 ## Layout
 
@@ -169,6 +174,7 @@ src/
   internal/
     serialization.ts         # payload/result codecs reusing the workflow's own schemas
     errors.ts                # HatchetError (infra failures -> defects)
+    sdkWorkarounds.ts        # Hatchet SDK worker workarounds (signals, stop, readiness)
 example/
   erp/                       # business code — zero Hatchet imports
     InvoiceService.ts
@@ -180,7 +186,10 @@ example/
 test/
   HatchetWorkflowEngine.test.ts  # mocked-Hatchet boundary tests
   e2e.test.ts                    # real Hatchet round trip
+  e2e.shutdown.test.ts           # SIGTERM and startup failures in a worker child process
+  e2e.sdk-canary.test.ts         # raw SDK behaviors that the workarounds depend on
   e2e.setup.ts                   # embedded engine unless a token is configured
+  fixtures/                      # worker process for the shutdown tests
 ```
 
 ## Releases

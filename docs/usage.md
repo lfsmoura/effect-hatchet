@@ -83,8 +83,18 @@ Effect.runPromise(
 
 `layerStrictFromConfig` loads the Hatchet token and connection settings through
 Effect `Config`, registers `GreetLive`, and starts the worker in the same scoped
-Layer. `awaitTermination` keeps the process running and fails if the worker
-stops with an error after startup; the scope stops the worker on shutdown.
+Layer. `awaitTermination` keeps the process running until one of these occurs:
+
+- The process gets SIGTERM or SIGINT. `awaitTermination` succeeds, and the
+  worker drains when the scope closes: it stops getting new tasks, and the
+  program returns after the running tasks complete and the Effect finalizers
+  run.
+- The worker stops without a shutdown request, or it cannot start.
+  `awaitTermination` fails with a `HatchetError` with reason `"Worker"`. If
+  this occurs during startup, the layer build fails immediately.
+
+The worker layer handles the signals itself, so a plain `Effect.runPromise` is
+sufficient. See [Shutdown: known limitations](#shutdown-known-limitations).
 
 ## 4. Create the client
 
@@ -263,3 +273,33 @@ export const SyncCustomer = Workflow.make("SyncCustomer", {
 Rules are registered with the workflow when the worker starts, so they apply to
 runs dispatched from any client. A run cancelled by a rule completes as
 interrupted for every caller waiting on it.
+
+## Shutdown: known limitations
+
+The worker shutdown depends on the behavior of `@hatchet-dev/typescript-sdk`.
+The library was tested with SDK 1.33.2. When the worker layer builds with a
+different SDK version, it writes a warning to the log, because the shutdown
+behavior can be different.
+
+1. A success from `awaitTermination` means that a shutdown was requested. The
+   worker drains when the scope closes.
+2. The SDK has its own SIGTERM and SIGINT handlers, and the library cannot
+   remove them safely. Thus, the SDK handler and the scope finalizer both drain
+   the worker. The library disables only the `process.exit` call of the SDK
+   handler.
+3. If a signal occurs before the worker connects, the worker connects for a
+   short time before it stops. During that time, it can get tasks that are in
+   the queue. The worker completes these tasks before it stops. Long tasks can
+   make the shutdown longer than the grace period of the orchestrator.
+4. A shutdown during startup can take up to the ready timeout (`readyTimeout`,
+   30 seconds by default): the scope finalizer waits for the worker to connect
+   before it stops the worker. If the timeout expires, the library writes a
+   warning to the log and stops the worker. The worker can still connect after
+   the finalizer completes and then get tasks. Thus, stop the process after the
+   program returns.
+5. If the layer fails because Hatchet is not available, the SDK continues to
+   try to connect for approximately 200 seconds. Stop the process after a layer
+   failure. `example/Worker.ts` does this with `process.exit(1)`.
+6. With `NodeRuntime.runMain`, SIGTERM also interrupts the main fiber. An
+   interruption is a different exit from a success, and the exit code can be
+   non-zero. This was not verified.

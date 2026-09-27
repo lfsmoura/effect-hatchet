@@ -49,6 +49,13 @@ Worker process entry points provide their worker layer to
 post-start worker failures; `Layer.launch` alone cannot propagate errors
 from a previously built layer's background fibers.
 
+The worker layer handles SIGTERM and SIGINT: a signal completes
+`awaitTermination` with a success, and only the layer's scope finalizer stops
+the worker, so the drain completes before the program returns. The SDK-specific
+parts of this (for example, disabling the SDK's `process.exit` on a signal) are
+in `src/internal/sdkWorkarounds.ts`, and each one has a canary test in
+`test/e2e.sdk-canary.test.ts`.
+
 ## Durability limit
 
 Hatchet persists task runs, but the Effect workflow contract also expects
