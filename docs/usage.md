@@ -263,3 +263,36 @@ export const SyncCustomer = Workflow.make("SyncCustomer", {
 Rules are registered with the workflow when the worker starts, so they apply to
 runs dispatched from any client. A run cancelled by a rule completes as
 interrupted for every caller waiting on it.
+
+## 8. Retry failed runs
+
+Effect's `Workflow` has no workflow-level retry setting; retry policy normally
+lives in the workflow code (`Effect.retry`, `Activity.retry`). To let Hatchet
+re-run a failed workflow instead, annotate it with
+`HatchetWorkflowEngine.Retry`. Without the annotation a workflow runs once.
+
+```ts
+export const SyncCustomer = Workflow.make("SyncCustomer", {
+  payload: { customerId: Schema.String },
+  success: Schema.Void,
+  idempotencyKey: ({ customerId }) => customerId
+}).annotate(HatchetWorkflowEngine.Retry, {
+  retries: 3,
+  // Wait 2^retryCount seconds between attempts, at most 60.
+  backoff: { factor: 2, maxSeconds: 60 }
+})
+```
+
+| Option | Meaning |
+| --- | --- |
+| `retries` | Re-runs after a failed attempt. Defaults to 0. |
+| `backoff.factor` | Base of the exponential backoff in seconds (`factor ^ retryCount`). |
+| `backoff.maxSeconds` | Upper bound for the backoff. Without `backoff`, Hatchet retries immediately. |
+
+An attempt that fails with a typed error or a defect fails its Hatchet task,
+so Hatchet schedules the next attempt under the same run; after the last
+attempt the run shows as `FAILED` in the dashboard. Interruption is never
+retried. Callers keep waiting across attempts and receive the final attempt's
+exit: its success, or its typed error or defect, decoded from the task error.
+Each retry re-runs the whole workflow, including inline activities in
+run-to-completion mode, so side effects must be idempotent.

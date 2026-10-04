@@ -142,6 +142,54 @@ describe("HatchetWorkflowEngine e2e", () => {
     expect(newest).toStrictEqual(Exit.succeed("newest"))
   })
 
+  it("re-runs failed attempts under a retry annotation and marks exhausted runs FAILED", async () => {
+    class Flake extends Schema.TaggedError<Flake>()("Flake", { attempt: Schema.Int, detail: Schema.String }) {}
+    const Flaky = Workflow.make("E2eFlaky", {
+      payload: { key: Schema.String, failures: Schema.Int },
+      success: Schema.Int,
+      error: Flake,
+      idempotencyKey: ({ key }) => key
+    }).annotate(HatchetWorkflowEngine.Retry, { retries: 2 })
+    // Large enough to show the encoded exit survives Hatchet's error storage.
+    const detail = "x".repeat(100_000)
+    const attempts = new Map<string, number>()
+    const client = HatchetClient.init({
+      token: hatchet.token,
+      ...(hatchet.hostPort !== undefined ? { host_port: hatchet.hostPort } : {}),
+      tls_config: { tls_strategy: "none" }
+    })
+    const FlakyWorker = HatchetWorker.layerRunToCompletion({
+      name: "e2e-retry-worker",
+      workflows: Flaky.toLayer(({ key, failures }) =>
+        Effect.suspend(() => {
+          const attempt = (attempts.get(key) ?? 0) + 1
+          attempts.set(key, attempt)
+          return attempt <= failures ? Effect.fail(new Flake({ attempt, detail })) : Effect.succeed(attempt)
+        })
+      )
+    }, config)
+
+    const suffix = Math.floor(Math.random() * 1_000_000)
+    const since = new Date()
+    const program = Effect.gen(function*() {
+      yield* Layer.build(FlakyWorker)
+      return yield* Effect.all([
+        Flaky.execute({ key: `recovers-${suffix}`, failures: 2 }).pipe(Effect.exit),
+        Flaky.execute({ key: `exhausts-${suffix}`, failures: 5 }).pipe(Effect.exit)
+      ], { concurrency: "unbounded" }).pipe(Effect.provide(ClientLive), Effect.timeout(60_000))
+    }).pipe(Effect.scoped)
+
+    const [recovered, exhausted] = await Effect.runPromise(program)
+    expect(recovered).toStrictEqual(Exit.succeed(3))
+    expect(attempts.get(`exhausts-${suffix}`)).toBe(3)
+    expect(Exit.isFailure(exhausted) ? Result.getOrUndefined(Cause.findError(exhausted.cause)) : undefined)
+      .toStrictEqual(new Flake({ attempt: 3, detail }))
+
+    // What the dashboard shows: the exhausted run failed, the recovered one completed.
+    const runs = await client.runs.list({ workflowNames: ["E2eFlaky"], since })
+    expect(runs.rows.map((row) => row.status).sort()).toEqual(["COMPLETED", "FAILED"])
+  }, 120_000)
+
   it("recovers namespaced runs across clients for poll and interrupt", async () => {
     const namespace = "effect_e2e_"
     const makeNamespacedConfig = (): HatchetWorkflowEngine.HatchetConfig => ({

@@ -16,3 +16,14 @@ export interface RunInput extends JsonObject {
 }
 /** Unwraps the task-name envelope returned by Hatchet's run details API. */
 export declare const unwrapTaskOutput: (workflowName: string, output: unknown) => unknown;
+/**
+ * Task failure carrying the encoded `Workflow.Result` so a FAILED Hatchet run
+ * still yields the workflow's typed exit. The result is single-line JSON after
+ * a marker line, independent of the surrounding human-readable text.
+ */
+export declare const failureError: (summary: string, encodedResult: JsonObject) => Error;
+/**
+ * Recovers the encoded result from a failed task's error, if present. Hatchet
+ * stores the worker's `{ message, stack }` failure event as a JSON string.
+ */
+export declare const failureResult: (error: string | undefined) => unknown;

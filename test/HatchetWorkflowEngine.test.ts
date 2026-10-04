@@ -82,9 +82,20 @@ const makeFakeHatchet = (
       return runId
     }
     runs.set(runId, { status: "RUNNING" })
-    void fn(input, { abortController: new AbortController() }).then(
+    // Hatchet re-runs a task that throws until its `retries` are exhausted.
+    const retries: number = taskOptions.get(name)?.retries ?? 0
+    const attempt = (retryCount: number): Promise<any> =>
+      fn(input, { abortController: new AbortController(), retryCount: () => retryCount }).catch((error) =>
+        retryCount < retries ? attempt(retryCount + 1) : Promise.reject(error)
+      )
+    void attempt(0).then(
       (output) => runs.set(runId, { status: "COMPLETED", output }),
-      (error) => runs.set(runId, { status: "FAILED", error: String(error) })
+      // Hatchet stores the worker's failure event as a JSON string.
+      (error) =>
+        runs.set(runId, {
+          status: "FAILED",
+          error: JSON.stringify({ message: error?.message ?? String(error), stack: error?.stack })
+        })
     )
     return runId
   }
@@ -189,11 +200,11 @@ describe("HatchetWorkflowEngine", () => {
     const error = Exit.isFailure(exit) ? firstError(exit.cause) : undefined
     expect(error).toBeInstanceOf(InvoiceNotFound)
     expect((error as InvoiceNotFound).invoiceId).toBe(-1)
-    // Application failure is NOT a Hatchet failure: the run completed and the
-    // typed error traveled inside the encoded exit. The failure happened in
-    // step 1 (load-invoice), so no child runs were ever dispatched.
+    // The Hatchet run fails, so dashboards show it, while the typed error
+    // travels inside the encoded exit. The failure happened in step 1
+    // (load-invoice), so no child runs were ever dispatched.
     expect(fake.runs.size).toBe(1)
-    expect([...fake.runs.values()][0]!.status).toBe("COMPLETED")
+    expect([...fake.runs.values()][0]!.status).toBe("FAILED")
   })
 
   it("joins the same execution when executed twice with the same payload", async () => {
@@ -448,5 +459,44 @@ describe("HatchetWorkflowEngine", () => {
     ])
     // Workflows without the annotation register no concurrency at all.
     expect(fake.taskOptions.get("ProcessLineItem")).not.toHaveProperty("concurrency")
+  })
+
+  it("re-runs failed attempts under the retry annotation and returns the last attempt's exit", async () => {
+    class Flake extends Schema.TaggedError<Flake>()("Flake", { attempt: Schema.Int }) {}
+    const Flaky = Workflow.make("Flaky", {
+      payload: { key: Schema.String, failures: Schema.Int },
+      success: Schema.Int,
+      error: Flake,
+      idempotencyKey: ({ key }) => key
+    }).annotate(HatchetWorkflowEngine.Retry, { retries: 2, backoff: { factor: 2, maxSeconds: 30 } })
+    const attempts = new Map<string, number>()
+    const fake = makeFakeHatchet()
+    const layer = Flaky.toLayer(({ key, failures }) =>
+      Effect.suspend(() => {
+        const attempt = (attempts.get(key) ?? 0) + 1
+        attempts.set(key, attempt)
+        return attempt <= failures ? Effect.fail(new Flake({ attempt })) : Effect.succeed(attempt)
+      })
+    ).pipe(
+      Layer.provideMerge(HatchetWorkflowEngine.layerRunToCompletion({
+        client: fake.client,
+        resultPollInterval: "10 millis"
+      }))
+    )
+
+    const [recovered, exhausted] = await Effect.runPromise(
+      Effect.all([
+        Flaky.execute({ key: "recovers", failures: 2 }).pipe(Effect.exit),
+        Flaky.execute({ key: "exhausts", failures: 5 }).pipe(Effect.exit)
+      ]).pipe(Effect.provide(layer))
+    )
+
+    expect(fake.taskOptions.get("Flaky")).toMatchObject({ retries: 2, backoff: { factor: 2, maxSeconds: 30 } })
+    expect(recovered).toStrictEqual(Exit.succeed(3))
+    // Retries exhausted: the final attempt's typed error reaches the caller.
+    expect(attempts.get("exhausts")).toBe(3)
+    expect(Exit.isFailure(exhausted) ? firstError(exhausted.cause) : undefined).toStrictEqual(
+      new Flake({ attempt: 3 })
+    )
   })
 })

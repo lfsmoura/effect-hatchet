@@ -61,3 +61,37 @@ export const unwrapTaskOutput = (workflowName: string, output: unknown): unknown
   }
   return output
 }
+
+const failureMarker = "effect-hatchet/exit:"
+const failurePattern = /effect-hatchet\/exit:(.*)$/m
+
+/**
+ * Task failure carrying the encoded `Workflow.Result` so a FAILED Hatchet run
+ * still yields the workflow's typed exit. The result is single-line JSON after
+ * a marker line, independent of the surrounding human-readable text.
+ */
+export const failureError = (summary: string, encodedResult: JsonObject): Error =>
+  new Error(`${summary}\n${failureMarker}${JSON.stringify(encodedResult)}`)
+
+const parseJson = (text: string): unknown => {
+  try {
+    return JSON.parse(text)
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * Recovers the encoded result from a failed task's error, if present. Hatchet
+ * stores the worker's `{ message, stack }` failure event as a JSON string.
+ */
+export const failureResult = (error: string | undefined): unknown => {
+  if (error === undefined) return undefined
+  const event = parseJson(error)
+  const message = typeof event === "object" && event !== null && "message" in event &&
+      typeof event.message === "string"
+    ? event.message
+    : error
+  const match = failurePattern.exec(message)
+  return match === null ? undefined : parseJson(match[1]!)
+}
