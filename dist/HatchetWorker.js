@@ -90,6 +90,25 @@ var unwrapTaskOutput = (workflowName, output) => {
   }
   return output;
 };
+var failureMarker = "effect-hatchet/exit:";
+var failurePattern = /effect-hatchet\/exit:(.*)$/m;
+var failureError = (summary, encodedResult) => new Error(`${summary}
+${failureMarker}${JSON.stringify(encodedResult)}`);
+var parseJson = (text) => {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return;
+  }
+};
+var failureResult = (error) => {
+  if (error === undefined)
+    return;
+  const event = parseJson(error);
+  const message = typeof event === "object" && event !== null && "message" in event && typeof event.message === "string" ? event.message : error;
+  const match = failurePattern.exec(message);
+  return match === null ? undefined : parseJson(match[1]);
+};
 
 // src/HatchetWorkflowEngine.ts
 var Concurrency = Context2.Reference("effect-hatchet/HatchetWorkflowEngine/Concurrency", { defaultValue: () => [] });
@@ -100,6 +119,7 @@ var toHatchetConcurrency = (rule) => ({
   ...rule.name !== undefined ? { name: rule.name } : {},
   ...rule.isTenantScoped === true ? { isTenantScoped: true } : {}
 });
+var Retry = Context2.Reference("effect-hatchet/HatchetWorkflowEngine/Retry", { defaultValue: () => ({ retries: 0 }) });
 var EnvironmentConfig = Config.all({
   token: Config.Redacted("HATCHET_CLIENT_TOKEN"),
   hostPort: Config.option(Config.String("HATCHET_CLIENT_HOST_PORT")),
@@ -173,13 +193,18 @@ var make = Effect2.gen(function* () {
       }
       case "CANCELLED":
         return Option.some(new Workflow2.Complete({ exit: Exit.failCause(Cause.interrupt()) }));
-      case "FAILED":
+      case "FAILED": {
+        const encoded = failureResult(taskRun?.error);
+        if (encoded !== undefined) {
+          return Option.some(yield* Effect2.orDie(codecFor(workflow).decodeResult(encoded)));
+        }
         return Option.some(new Workflow2.Complete({
           exit: Exit.die(new HatchetError({
             reason: "AwaitResult",
             message: taskRun?.error ?? `Hatchet run for ${workflow._tag} failed`
           }))
         }));
+      }
       default:
         return Option.none();
     }
@@ -238,9 +263,11 @@ var make = Effect2.gen(function* () {
       }
       const codec = codecFor(workflow);
       const concurrency = Context2.get(workflow.annotations, Concurrency);
+      const retry = Context2.get(workflow.annotations, Retry);
       const task = state.client.task({
         name: workflow._tag,
-        retries: 0,
+        retries: retry.retries,
+        ...retry.backoff !== undefined ? { backoff: retry.backoff } : {},
         ...concurrency.length > 0 ? { concurrency: concurrency.map(toHatchetConcurrency) } : {},
         idempotency: {
           expression: "input.executionId",
@@ -249,7 +276,8 @@ var make = Effect2.gen(function* () {
         },
         fn: (input, ctx) => {
           const instance = WorkflowEngine.WorkflowInstance.initial(workflow, input.executionId);
-          const effect = codec.decodePayload(input.payload).pipe(Effect2.orDie, Effect2.flatMap((payload) => execute(payload, input.executionId)), Workflow2.intoResult, (run) => deferredState.trackRun(instance, run), Effect2.flatMap((result) => Effect2.orDie(codec.encodeResult(result))), Effect2.provideService(WorkflowEngine.WorkflowEngine, engine));
+          const effect = codec.decodePayload(input.payload).pipe(Effect2.orDie, Effect2.flatMap((payload) => execute(payload, input.executionId)), Workflow2.intoResult, (run) => deferredState.trackRun(instance, run), Effect2.flatMap((result) => Effect2.orDie(codec.encodeResult(result)).pipe(Effect2.flatMap((encoded) => result._tag === "Complete" && Exit.isFailure(result.exit) && !Cause.hasInterruptsOnly(result.exit.cause) ? Effect2.die(failureError(`Workflow ${workflow._tag} failed:
+${Cause.pretty(result.exit.cause)}`, encoded)) : Effect2.succeed(encoded)))), Effect2.provideService(WorkflowEngine.WorkflowEngine, engine));
           return Effect2.runPromise(effect, { signal: ctx.abortController.signal });
         }
       });

@@ -158,7 +158,8 @@ The e2e suite proves: real dispatch → Hatchet server → worker → Effect run
 Layer-provided services → typed result/error back to the caller; the parent run
 fans out three real `ProcessLineItem` child runs and joins them; concurrent
 duplicate executions (parents *and* children) join a single run each; a
-`Concurrency` annotation cancels queued runs except the newest.
+`Concurrency` annotation cancels queued runs except the newest; a `Retry`
+annotation re-runs failed attempts and returns the final attempt's exit.
 
 ## Layout
 

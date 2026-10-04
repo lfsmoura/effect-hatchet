@@ -25,7 +25,7 @@ import {
 } from "./internal/errors.ts"
 import { type ActivityMode, HatchetRuntime } from "./internal/HatchetRuntime.ts"
 import type { RunInput } from "./internal/serialization.ts"
-import { codecFor, unwrapTaskOutput } from "./internal/serialization.ts"
+import { codecFor, failureError, failureResult, unwrapTaskOutput } from "./internal/serialization.ts"
 
 export interface HatchetConfig {
   /** Inject an existing client, primarily for tests and custom transports. */
@@ -97,6 +97,37 @@ const toHatchetConcurrency = (rule: ConcurrencyRule): HatchetConcurrency => ({
   ...(rule.name !== undefined ? { name: rule.name } : {}),
   ...(rule.isTenantScoped === true ? { isTenantScoped: true } : {})
 })
+
+/** Hatchet retry policy for a workflow's runs. */
+export interface RetryPolicy {
+  /** Re-runs of the whole workflow after a failed attempt. Defaults to 0. */
+  readonly retries: number
+  /**
+   * Exponential backoff between attempts: `factor ^ retryCount` seconds,
+   * capped at `maxSeconds`. Without it Hatchet retries immediately.
+   */
+  readonly backoff?: {
+    readonly factor?: number
+    readonly maxSeconds?: number
+  }
+}
+
+/**
+ * Workflow annotation that registers a Hatchet retry policy. A failed attempt
+ * (typed error or defect, not interruption) re-runs the entire workflow,
+ * including inline activities; the final attempt's exit reaches the caller.
+ *
+ * ```ts
+ * const SyncCustomer = Workflow.make("SyncCustomer", { ... }).annotate(
+ *   HatchetWorkflowEngine.Retry,
+ *   { retries: 3, backoff: { factor: 2, maxSeconds: 60 } }
+ * )
+ * ```
+ */
+export const Retry = Context.Reference<RetryPolicy>(
+  "effect-hatchet/HatchetWorkflowEngine/Retry",
+  { defaultValue: () => ({ retries: 0 }) }
+)
 
 const EnvironmentConfig = Config.all({
   token: Config.Redacted("HATCHET_CLIENT_TOKEN"),
@@ -210,7 +241,12 @@ const make: Effect.Effect<WorkflowEngine.WorkflowEngine["Service"], never, Hatch
           }
           case "CANCELLED":
             return Option.some(new Workflow.Complete({ exit: Exit.failCause(Cause.interrupt()) }))
-          case "FAILED":
+          case "FAILED": {
+            // Failed workflow attempts carry their encoded exit in the error.
+            const encoded = failureResult(taskRun?.error)
+            if (encoded !== undefined) {
+              return Option.some(yield* Effect.orDie(codecFor(workflow).decodeResult(encoded)))
+            }
             return Option.some(
               new Workflow.Complete({
                 exit: Exit.die(
@@ -221,6 +257,7 @@ const make: Effect.Effect<WorkflowEngine.WorkflowEngine["Service"], never, Hatch
                 )
               })
             )
+          }
           default:
             return Option.none<Workflow.Result<unknown, unknown>>()
         }
@@ -302,9 +339,11 @@ const make: Effect.Effect<WorkflowEngine.WorkflowEngine["Service"], never, Hatch
           }
           const codec = codecFor(workflow)
           const concurrency = Context.get(workflow.annotations, Concurrency)
+          const retry = Context.get(workflow.annotations, Retry)
           const task = state.client.task<RunInput, JsonObject>({
             name: workflow._tag,
-            retries: 0,
+            retries: retry.retries,
+            ...(retry.backoff !== undefined ? { backoff: retry.backoff } : {}),
             ...(concurrency.length > 0 ? { concurrency: concurrency.map(toHatchetConcurrency) } : {}),
             idempotency: {
               expression: "input.executionId",
@@ -318,7 +357,20 @@ const make: Effect.Effect<WorkflowEngine.WorkflowEngine["Service"], never, Hatch
                 Effect.flatMap((payload) => execute(payload as object, input.executionId)),
                 Workflow.intoResult,
                 (run) => deferredState.trackRun(instance, run),
-                Effect.flatMap((result) => Effect.orDie(codec.encodeResult(result))),
+                // A failed workflow fails the Hatchet task, so the dashboard shows
+                // it and Hatchet applies the Retry policy; the encoded exit rides
+                // in the error so callers still receive the typed failure.
+                Effect.flatMap((result) =>
+                  Effect.orDie(codec.encodeResult(result)).pipe(Effect.flatMap((encoded) =>
+                    result._tag === "Complete" && Exit.isFailure(result.exit) &&
+                      !Cause.hasInterruptsOnly(result.exit.cause)
+                      ? Effect.die(failureError(
+                        `Workflow ${workflow._tag} failed:\n${Cause.pretty(result.exit.cause)}`,
+                        encoded
+                      ))
+                      : Effect.succeed(encoded)
+                  ))
+                ),
                 Effect.provideService(WorkflowEngine.WorkflowEngine, engine)
               )
               return Effect.runPromise(effect, { signal: ctx.abortController.signal })

@@ -20,6 +20,9 @@ startup. Replacing the engine does not change workflow definitions or handlers.
 5. The workflow's schemas encode the payload and typed `Exit` across the boundary.
 6. Infrastructure failures become `HatchetError` defects; application failures
    remain typed workflow errors.
+7. A failed workflow fails its Hatchet task, so the run shows as `FAILED`; the
+   encoded `Exit` travels in the task error and is decoded for the caller.
+   Workflows annotated with `Retry` are re-run by Hatchet before that.
 
 ## Contract coverage
 

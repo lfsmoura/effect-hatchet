@@ -80,7 +80,7 @@ defects. Run-to-completion mode additionally enables non-durable, at-least-once
 The error taxonomy also mapped exactly onto the precedent set by
 `ClusterWorkflowEngine` (which `orDie`s persistence errors):
 
-- **Effect workflow failure** → typed error in the encoded exit; Hatchet run succeeds.
+- **Effect workflow failure** → the Hatchet task fails (so the run shows as `FAILED`), with the encoded exit embedded in the error; the caller decodes it back into the typed error.
 - **Effect defect** → captured into the exit by `Workflow.intoResult` (`CaptureDefects`), rethrown as a defect at the caller.
 - **Hatchet infrastructure failure** (dispatch error, worker crash, run `FAILED`/timeout) → `HatchetError` defect, never a typed application error.
 
@@ -98,8 +98,9 @@ to checkpoint arbitrary workflow state. Consequences in this PoC:
 - `Workflow.resume`, `DurableDeferred`, `DurableClock` → structured defect.
 - Strict mode rejects `Activity`; run-to-completion mode executes it inline
   without persistence. A workflow is durable at the whole-run granularity
-  (Hatchet retries/requeues re-run the entire workflow, so engine-level
-  `retries` is pinned to 0 and retry policy belongs in the Effect code).
+  (Hatchet retries/requeues re-run the entire workflow; engine-level
+  `retries` defaults to 0 and is opt-in per workflow via the `Retry`
+  annotation, since Effect has no workflow-level retry setting).
 - A cancelled Hatchet run surfaces as an interrupted exit, but the
   interrupt-during-suspension dance cluster does has no equivalent.
 - Child-workflow durability is bounded by idempotency-key lifetime: a parent

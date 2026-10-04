@@ -60,6 +60,32 @@ export type ConcurrencyRule = ConcurrencyRuleBase & ({
  * ```
  */
 export declare const Concurrency: Context.Reference<readonly ConcurrencyRule[]>;
+/** Hatchet retry policy for a workflow's runs. */
+export interface RetryPolicy {
+    /** Re-runs of the whole workflow after a failed attempt. Defaults to 0. */
+    readonly retries: number;
+    /**
+     * Exponential backoff between attempts: `factor ^ retryCount` seconds,
+     * capped at `maxSeconds`. Without it Hatchet retries immediately.
+     */
+    readonly backoff?: {
+        readonly factor?: number;
+        readonly maxSeconds?: number;
+    };
+}
+/**
+ * Workflow annotation that registers a Hatchet retry policy. A failed attempt
+ * (typed error or defect, not interruption) re-runs the entire workflow,
+ * including inline activities; the final attempt's exit reaches the caller.
+ *
+ * ```ts
+ * const SyncCustomer = Workflow.make("SyncCustomer", { ... }).annotate(
+ *   HatchetWorkflowEngine.Retry,
+ *   { retries: 3, backoff: { factor: 2, maxSeconds: 60 } }
+ * )
+ * ```
+ */
+export declare const Retry: Context.Reference<RetryPolicy>;
 /** Effect-native Hatchet configuration loaded from the current ConfigProvider. */
 export declare const configFromEnv: Effect.Effect<HatchetConfig, Config.ConfigError>;
 /** @internal Shared engine/runtime layer used by HatchetWorker. */
